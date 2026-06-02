@@ -33,9 +33,17 @@ fn analyze_trades(
     trades: Vec<Trade>,
     current_prices: Option<HashMap<String, Decimal>>,
 ) -> (TradePnL, Vec<ClosedTrade>) {
+    analyze_trades_with_multiplier(trades, current_prices, Decimal::ONE)
+}
+
+fn analyze_trades_with_multiplier(
+    trades: Vec<Trade>,
+    current_prices: Option<HashMap<String, Decimal>>,
+    multiplier: Decimal,
+) -> (TradePnL, Vec<ClosedTrade>) {
     let mut tracker = TradeTracker::new();
     for trade in trades {
-        tracker.process_trade(&trade, None, None, Decimal::ZERO);
+        tracker.process_trade(&trade, multiplier, None, None, Decimal::ZERO);
     }
     (
         tracker.calculate_pnl(current_prices),
@@ -96,6 +104,34 @@ fn test_trade_analyzer_short_loss() {
 }
 
 #[test]
+fn test_trade_analyzer_respects_contract_multiplier_for_closed_trade() {
+    let t1 = create_trade(
+        "RB2310",
+        OrderSide::Buy,
+        Decimal::ONE,
+        Decimal::from(4000),
+        Decimal::ZERO,
+    );
+    let t2 = create_trade(
+        "RB2310",
+        OrderSide::Sell,
+        Decimal::ONE,
+        Decimal::from(4010),
+        Decimal::ZERO,
+    );
+
+    let (pnl, closed_trades) =
+        analyze_trades_with_multiplier(vec![t1, t2], None, Decimal::from(10));
+
+    assert_eq!(pnl.gross_pnl, 100.0);
+    assert_eq!(pnl.net_pnl, 100.0);
+    assert_eq!(closed_trades.len(), 1);
+    assert_eq!(closed_trades[0].pnl, 100.0);
+    assert_eq!(closed_trades[0].net_pnl, 100.0);
+    assert!((closed_trades[0].return_pct - 0.25).abs() < 1e-9);
+}
+
+#[test]
 fn test_trade_analyzer_fifo() {
     // Buy 100 @ 10
     // Buy 100 @ 12
@@ -146,6 +182,25 @@ fn test_unrealized_pnl() {
 
     assert_eq!(pnl.total_closed_trades, 0);
     assert_eq!(pnl.unrealized_pnl, 500.0); // (15-10)*100
+}
+
+#[test]
+fn test_unrealized_pnl_respects_contract_multiplier() {
+    let t1 = create_trade(
+        "RB2310",
+        OrderSide::Buy,
+        Decimal::ONE,
+        Decimal::from(4000),
+        Decimal::ZERO,
+    );
+
+    let mut prices = HashMap::new();
+    prices.insert("RB2310".to_string(), Decimal::from(4010));
+
+    let (pnl, _) = analyze_trades_with_multiplier(vec![t1], Some(prices), Decimal::from(10));
+
+    assert_eq!(pnl.total_closed_trades, 0);
+    assert_eq!(pnl.unrealized_pnl, 100.0);
 }
 
 #[test]

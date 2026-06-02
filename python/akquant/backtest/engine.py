@@ -4475,12 +4475,55 @@ def run_warm_start(
         data_map = {}
         # Copied logic from run_backtest for data loading
         if isinstance(data, pd.DataFrame):
-            if len(symbols) == 1:
-                data_map = {symbols[0]: data}
+            df_input = data
+            if not isinstance(df_input.index, pd.DatetimeIndex):
+                found_date = False
+                for col in ["date", "timestamp", "datetime", "Date", "Timestamp"]:
+                    if col in df_input.columns:
+                        df_input = df_input.set_index(col)
+                        found_date = True
+                        break
+
+                if not found_date:
+                    try:
+                        df_input.index = pd.to_datetime(df_input.index)
+                    except Exception:
+                        pass
+
+            if df_input.index.dtype == "object":
+                try:
+                    df_input.index = pd.to_datetime(df_input.index)
+                except Exception:
+                    pass
+
+            if isinstance(df_input.index, pd.DatetimeIndex):
+                df_input = _filter_datetime_index_frame_by_runtime_window(
+                    df_input,
+                    kwargs.get("start_time"),
+                    kwargs.get("end_time"),
+                    timezone_name,
+                )
+
+            df_prepared = prepare_dataframe(df_input)
+            if "symbol" in df_prepared.columns:
+                df_prepared = df_prepared.copy()
+                df_prepared["symbol"] = df_prepared["symbol"].astype(str)
+                filter_symbols = bool(symbols and "BENCHMARK" not in symbols)
+                if filter_symbols:
+                    df_prepared = df_prepared[df_prepared["symbol"].isin(symbols)]
+                if not df_prepared.empty:
+                    grouped = df_prepared.groupby("symbol", sort=False)
+                    data_map = {
+                        str(grouped_symbol): grouped_df.copy()
+                        for grouped_symbol, grouped_df in grouped
+                    }
+            elif len(symbols) == 1:
+                data_map = {symbols[0]: df_prepared}
             else:
-                # Multi-index or strict format required?
-                # For simplicity, assume single symbol if passed as DF
-                data_map = {symbols[0]: data}
+                raise ValueError(
+                    "Warm start multi-symbol DataFrame input must contain "
+                    "a 'symbol' column"
+                )
         elif isinstance(data, list) and data and isinstance(data[0], Bar):
             # Convert List[Bar] to DataFrame for indicators
             # We assume all bars are for the same symbol (or single symbol context)
@@ -5336,6 +5379,16 @@ def run_warm_start(
     if hasattr(engine, "set_stock_fee_rules"):
         engine.set_stock_fee_rules(commission, stamp_tax, transfer_fee, min_commission)
         logger.info(f"Re-configured market fees: comm={commission}, stamp={stamp_tax}")
+    restored_initial_market_value = float(restored_cash)
+    if hasattr(engine, "get_account_metrics"):
+        try:
+            account_metrics = cast(Any, engine).get_account_metrics()
+            if isinstance(account_metrics, tuple) and len(account_metrics) >= 1:
+                restored_initial_market_value = float(account_metrics[0])
+        except Exception:
+            restored_initial_market_value = float(restored_cash)
+    if hasattr(engine, "set_initial_cash_reference"):
+        cast(Any, engine).set_initial_cash_reference(restored_initial_market_value)
     resolved_policy_warm_start: Optional[ResolvedExecutionPolicy] = None
     if has_fill_policy_override:
         resolved_policy_warm_start = _resolve_execution_policy(
@@ -5473,9 +5526,6 @@ def run_warm_start(
                         ),
                     )
 
-    # 注意：这里的 initial_cash 可能不准确，因为它使用的是当前 cash
-    # 但对于 BacktestResult 来说，重要的是 equity curve 的连续性
-    # 我们使用之前捕获的 restored_cash 作为 reference
     result = BacktestResult(
         engine.get_results(),
         timezone=timezone_name,
@@ -5484,6 +5534,10 @@ def run_warm_start(
         engine=engine,
         indicator_outputs=indicator_recorder.build_payload(),
     )
+    try:
+        result.initial_cash = float(result.metrics.initial_market_value)
+    except Exception:
+        pass
     _attach_result_runtime_metadata(
         result=result,
         engine_summary=engine_summary,

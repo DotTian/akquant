@@ -458,7 +458,13 @@ fn apply_liquidation_trade_simulation(
     let portfolio_value =
         calculate_account_metrics(portfolio, prices, instruments, trade_tracker, risk_config)
             .equity;
-    trade_tracker.process_trade(trade, Some("__forced_liquidation__"), None, portfolio_value);
+    trade_tracker.process_trade(
+        trade,
+        multiplier,
+        Some("__forced_liquidation__"),
+        None,
+        portfolio_value,
+    );
 }
 
 impl Default for SettlementManager {

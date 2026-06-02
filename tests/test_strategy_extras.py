@@ -2854,6 +2854,29 @@ class WarmStartMultiSymbolStrategy(Strategy):
         self.by_symbol[bar.symbol] = self.by_symbol.get(bar.symbol, 0) + 1
 
 
+class WarmStartMultiSymbolDataFrameStrategy(Strategy):
+    """Strategy for multi-symbol dataframe warm-start regression tests."""
+
+    def __init__(self) -> None:
+        """Initialize deterministic event capture."""
+        self.set_history_depth(2)
+        self.records: list[tuple[int, str, str, float | None, float | None]] = []
+
+    def on_bar(self, bar: Bar) -> None:
+        """Capture symbol resolution and per-symbol close history."""
+        aaa_last = float(self.get_history(1, symbol="AAA", field="close")[-1])
+        bbb_last = float(self.get_history(1, symbol="BBB", field="close")[-1])
+        self.records.append(
+            (
+                int(bar.timestamp),
+                str(bar.symbol),
+                str(self.symbol),
+                None if np.isnan(aaa_last) else aaa_last,
+                None if np.isnan(bbb_last) else bbb_last,
+            )
+        )
+
+
 def _make_symbol_df(
     symbol: str,
     start: str,
@@ -2873,6 +2896,16 @@ def _make_symbol_df(
             "volume": [1000.0 + float(i) for i in range(periods)],
             "symbol": [symbol] * periods,
         }
+    )
+
+
+def _combine_symbol_frames(*frames: pd.DataFrame) -> pd.DataFrame:
+    """Combine symbol frames into one timestamp-sorted long dataframe."""
+    return cast(
+        pd.DataFrame,
+        pd.concat(list(frames), ignore_index=True)
+        .sort_values(["timestamp", "symbol"])
+        .reset_index(drop=True),
     )
 
 
@@ -2913,6 +2946,115 @@ def test_run_warm_start_multi_symbol_continuity(tmp_path: Path) -> None:
     resume_idx = strategy.events.index("on_resume")
     assert strategy.events[resume_idx + 1] == "on_start"
     assert result2.metrics.initial_market_value == result1.metrics.end_market_value
+
+
+def test_run_warm_start_multi_symbol_dataframe_continuity(tmp_path: Path) -> None:
+    """Warm start should preserve symbol routing for multi-symbol dataframe input."""
+    checkpoint = tmp_path / "snapshot_multi_dataframe.pkl"
+    phase1_aaa = _make_symbol_df("AAA", "2023-01-01", 3, 100.0)
+    phase1_bbb = _make_symbol_df("BBB", "2023-01-01", 3, 200.0)
+    phase2_aaa = _make_symbol_df("AAA", "2023-01-04", 2, 103.0)
+    phase2_bbb = _make_symbol_df("BBB", "2023-01-04", 2, 203.0)
+    phase1 = _combine_symbol_frames(phase1_aaa, phase1_bbb)
+    phase2 = _combine_symbol_frames(phase2_aaa, phase2_bbb)
+    full = _combine_symbol_frames(phase1, phase2)
+
+    full_result = run_backtest(
+        data=full,
+        strategy=WarmStartMultiSymbolDataFrameStrategy,
+        symbols=["AAA", "BBB"],
+        initial_cash=100000.0,
+        show_progress=False,
+    )
+    result1 = run_backtest(
+        data=phase1,
+        strategy=WarmStartMultiSymbolDataFrameStrategy,
+        symbols=["AAA", "BBB"],
+        initial_cash=100000.0,
+        show_progress=False,
+    )
+    save_snapshot(result1.engine, result1.strategy, str(checkpoint))  # type: ignore[arg-type]
+
+    warm_result = run_warm_start(
+        checkpoint_path=str(checkpoint),
+        data=phase2,
+        symbols=["AAA", "BBB"],
+        show_progress=False,
+    )
+
+    full_strategy = full_result.strategy
+    warm_strategy = warm_result.strategy
+    assert full_strategy is not None
+    assert warm_strategy is not None
+    assert warm_strategy.records == full_strategy.records
+    assert all(
+        bar_symbol == self_symbol
+        for _, bar_symbol, self_symbol, _, _ in warm_strategy.records
+    )
+
+
+class WarmStartOpenPositionMetricsStrategy(Strategy):
+    """Strategy for open-position warm-start metric continuity tests."""
+
+    def __init__(self) -> None:
+        """Initialize deterministic trading state."""
+        self.submitted = False
+
+    def on_bar(self, bar: Bar) -> None:
+        """Open one futures position and keep it across warm start."""
+        if not self.submitted:
+            self.buy(symbol="FUT", quantity=1.0)
+            self.submitted = True
+
+
+def test_run_warm_start_open_position_preserves_initial_market_value(
+    tmp_path: Path,
+) -> None:
+    """Warm start should use prior end equity as the new initial market value."""
+    checkpoint = tmp_path / "snapshot_open_position.pkl"
+    phase1 = _make_bars("2023-01-01", 3, symbol="FUT", start_price=100.0)
+    phase2 = _make_bars("2023-01-04", 2, symbol="FUT", start_price=103.0)
+    config = BacktestConfig(
+        strategy_config=StrategyConfig(exit_on_last_bar=False),
+        instruments_config=[
+            InstrumentConfig(
+                symbol="FUT",
+                asset_type="FUTURES",
+                multiplier=10.0,
+                margin_ratio=0.1,
+                tick_size=0.2,
+            )
+        ],
+    )
+
+    result1 = run_backtest(
+        data=phase1,
+        strategy=WarmStartOpenPositionMetricsStrategy,
+        symbols="FUT",
+        initial_cash=100000.0,
+        show_progress=False,
+        fill_policy={"price_basis": "close", "temporal": "same_cycle"},
+        config=config,
+    )
+    save_snapshot(result1.engine, result1.strategy, str(checkpoint))  # type: ignore[arg-type]
+
+    result2 = run_warm_start(
+        checkpoint_path=str(checkpoint),
+        data=phase2,
+        symbols="FUT",
+        show_progress=False,
+        fill_policy={"price_basis": "close", "temporal": "same_cycle"},
+        config=config,
+    )
+
+    assert result1.metrics.end_market_value > result1.strategy.get_account()["cash"]  # type: ignore[union-attr]
+    assert result2.metrics.initial_market_value == pytest.approx(
+        result1.metrics.end_market_value
+    )
+    assert result2.metrics.total_return == pytest.approx(
+        (result2.metrics.end_market_value - result2.metrics.initial_market_value)
+        / result2.metrics.initial_market_value
+    )
 
 
 class WarmStartEventIdempotencyStrategy(Strategy):

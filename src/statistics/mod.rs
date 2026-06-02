@@ -131,7 +131,7 @@ impl StatisticsManager {
             let margin_dec = market_value * margin_ratio;
             let margin_f64 = margin_dec.to_f64().unwrap_or(0.0);
 
-            let unrealized_pnl = trade_tracker.get_unrealized_pnl(symbol, price, multiplier);
+            let unrealized_pnl = trade_tracker.get_unrealized_pnl(symbol, price);
             let unrealized_pnl_f64 = unrealized_pnl.to_f64().unwrap_or(0.0);
 
             let entry_price = trade_tracker.get_average_price(symbol);

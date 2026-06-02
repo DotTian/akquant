@@ -592,6 +592,11 @@ impl Engine {
             current_time: self.clock.timestamp().unwrap_or(0),
             portfolio: self.state.portfolio.clone(),
             order_manager: self.state.order_manager.clone(),
+            last_prices: self.last_prices.clone(),
+            instruments: self.instruments.clone(),
+            initial_cash: Some(self.initial_cash),
+            margin_accrued_interest: self.margin_accrued_interest,
+            margin_daily_interest: self.margin_daily_interest,
             history_state,
             strategy_risk_state: crate::engine::state::StrategyRiskStateSnapshot {
                 default_strategy_id: self.default_strategy_id.clone(),
@@ -639,6 +644,11 @@ impl Engine {
 
         self.state.portfolio = snapshot.portfolio;
         self.state.order_manager = snapshot.order_manager;
+        self.last_prices = snapshot.last_prices;
+        self.instruments = snapshot.instruments;
+        self.initial_cash = snapshot.initial_cash.unwrap_or(self.state.portfolio.cash);
+        self.margin_accrued_interest = snapshot.margin_accrued_interest;
+        self.margin_daily_interest = snapshot.margin_daily_interest;
         let history_buffer = snapshot
             .history_state
             .map(crate::history::HistoryBuffer::from);
@@ -1049,6 +1059,14 @@ impl Engine {
         let val = Decimal::from_f64(cash).unwrap_or(Decimal::ZERO);
         self.state.portfolio.cash = val;
         self.initial_cash = val;
+    }
+
+    /// 设置绩效统计使用的初始基线资金，不修改当前组合现金
+    ///
+    /// :param cash: 作为绩效基线的初始权益
+    /// :type cash: float
+    pub fn set_initial_cash_reference(&mut self, cash: f64) {
+        self.initial_cash = Decimal::from_f64(cash).unwrap_or(Decimal::ZERO);
     }
 
     /// 添加数据源

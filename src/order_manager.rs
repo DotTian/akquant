@@ -382,9 +382,9 @@ impl OrderManager {
 
             // 3. Update Portfolio
             portfolio.adjust_cash(-trade.commission);
+            let multiplier = instr_opt.map_or(Decimal::ONE, |instr| instr.multiplier());
 
             if let Some(instr) = instr_opt {
-                let multiplier = instr.multiplier();
                 if is_futures_margin_account(instr, risk_config) {
                     let realized = estimate_futures_realized_pnl(
                         &self.trade_tracker,
@@ -471,7 +471,7 @@ impl OrderManager {
             .equity;
 
             self.trade_tracker
-                .process_trade(&trade, order_tag, symbol_history, portfolio_value);
+                .process_trade(&trade, multiplier, order_tag, symbol_history, portfolio_value);
 
             // 6. Record Trade
             self.trades.push(trade.clone());

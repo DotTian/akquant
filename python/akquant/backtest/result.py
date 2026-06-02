@@ -247,15 +247,6 @@ class BacktestResult:
                 self._initial_cash = initial_cash
 
             def __getattr__(self, name: str) -> Any:
-                # Override initial_market_value if we have a valid initial_cash
-                if name == "initial_market_value" and self._initial_cash > 0:
-                    return self._initial_cash
-
-                # Recalculate total_return based on corrected initial_market_value
-                if name == "total_return" and self._initial_cash > 0:
-                    end_val = getattr(self._raw, "end_market_value")
-                    return (end_val - self._initial_cash) / self._initial_cash
-
                 val = getattr(self._raw, name)
                 if name in ["start_time", "end_time"]:
                     # Convert ns timestamp to datetime

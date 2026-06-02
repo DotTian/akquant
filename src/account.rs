@@ -106,7 +106,7 @@ pub fn calculate_account_metrics(
         let multiplier = instrument.multiplier();
         let notional = quantity.abs() * price * multiplier;
         if is_futures_margin_account(instrument, risk_config) {
-            let unrealized = trade_tracker.get_unrealized_pnl(symbol, price, multiplier);
+            let unrealized = trade_tracker.get_unrealized_pnl(symbol, price);
             let margin = crate::margin::MarginEngine::position_margin(
                 *quantity,
                 price,

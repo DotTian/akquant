@@ -128,6 +128,11 @@ mod tests {
             current_time: 123456789,
             portfolio,
             order_manager,
+            last_prices: HashMap::new(),
+            instruments: HashMap::new(),
+            initial_cash: Some(Decimal::from(50000)),
+            margin_accrued_interest: Decimal::ZERO,
+            margin_daily_interest: Decimal::ZERO,
             history_state: Some(HistoryBufferSnapshot {
                 data: HashMap::new(),
                 default_capacity: 3,
@@ -140,6 +145,9 @@ mod tests {
 
         assert_eq!(decoded.current_time, 123456789);
         assert_eq!(decoded.portfolio.cash, Decimal::from(50000));
+        assert_eq!(decoded.initial_cash, Some(Decimal::from(50000)));
+        assert!(decoded.last_prices.is_empty());
+        assert!(decoded.instruments.is_empty());
         assert_eq!(
             decoded
                 .history_state

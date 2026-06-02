@@ -10,6 +10,7 @@ use std::sync::Arc;
 pub struct TradeEntry {
     pub quantity: Decimal,
     pub price: Decimal,
+    pub multiplier: Decimal,
     pub commission: Decimal,
     pub bar_idx: usize,
     pub timestamp: i64,
@@ -89,21 +90,20 @@ impl TradeTracker {
         &self,
         symbol: &str,
         current_price: Decimal,
-        multiplier: Decimal,
     ) -> Decimal {
         let mut pnl = Decimal::ZERO;
 
         // Long positions: (Price - Entry) * Qty * Multiplier
         if let Some(queue) = self.long_inventory.get(symbol) {
             for entry in queue {
-                pnl += (current_price - entry.price) * entry.quantity * multiplier;
+                pnl += (current_price - entry.price) * entry.quantity * entry.multiplier;
             }
         }
 
         // Short positions: (Entry - Price) * Qty * Multiplier
         if let Some(queue) = self.short_inventory.get(symbol) {
             for entry in queue {
-                pnl += (entry.price - current_price) * entry.quantity * multiplier;
+                pnl += (entry.price - current_price) * entry.quantity * entry.multiplier;
             }
         }
 
@@ -113,6 +113,7 @@ impl TradeTracker {
     pub fn process_trade(
         &mut self,
         trade: &Trade,
+        multiplier: Decimal,
         order_tag: Option<&str>,
         history: Option<&SymbolHistory>,
         portfolio_value: Decimal,
@@ -139,10 +140,12 @@ impl TradeTracker {
                         let covered_qty = remaining_qty.min(match_entry.quantity);
 
                         // Short PnL = (Entry Price - Exit Price) * Qty
-                        let pnl = (match_entry.price - price) * covered_qty;
+                        let pnl =
+                            (match_entry.price - price) * covered_qty * match_entry.multiplier;
                         self.total_pnl += pnl;
 
-                        let entry_val = match_entry.price * covered_qty;
+                        let entry_val =
+                            match_entry.price * covered_qty * match_entry.multiplier;
                         let ret_pct = if !entry_val.is_zero() {
                             pnl / entry_val
                         } else {
@@ -345,6 +348,7 @@ impl TradeTracker {
                         .push_back(TradeEntry {
                             quantity: remaining_qty,
                             price,
+                            multiplier,
                             commission: remaining_comm,
                             bar_idx,
                             timestamp,
@@ -361,10 +365,12 @@ impl TradeTracker {
                         let covered_qty = remaining_qty.min(match_entry.quantity);
 
                         // Long PnL = (Exit Price - Entry Price) * Qty
-                        let pnl = (price - match_entry.price) * covered_qty;
+                        let pnl =
+                            (price - match_entry.price) * covered_qty * match_entry.multiplier;
                         self.total_pnl += pnl;
 
-                        let entry_val = match_entry.price * covered_qty;
+                        let entry_val =
+                            match_entry.price * covered_qty * match_entry.multiplier;
                         let ret_pct = if !entry_val.is_zero() {
                             pnl / entry_val
                         } else {
@@ -560,6 +566,7 @@ impl TradeTracker {
                         .push_back(TradeEntry {
                             quantity: remaining_qty,
                             price,
+                            multiplier,
                             commission: remaining_comm,
                             bar_idx,
                             timestamp,
@@ -605,14 +612,16 @@ impl TradeTracker {
             for (symbol, inventory) in &self.long_inventory {
                 if let Some(price) = prices.get(symbol) {
                     for entry in inventory {
-                        unrealized_pnl += (*price - entry.price) * entry.quantity;
+                        unrealized_pnl +=
+                            (*price - entry.price) * entry.quantity * entry.multiplier;
                     }
                 }
             }
             for (symbol, inventory) in &self.short_inventory {
                 if let Some(price) = prices.get(symbol) {
                     for entry in inventory {
-                        unrealized_pnl += (entry.price - *price) * entry.quantity;
+                        unrealized_pnl +=
+                            (entry.price - *price) * entry.quantity * entry.multiplier;
                     }
                 }
             }

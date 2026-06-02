@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::data::DataFeed;
 use crate::history::HistoryBufferSnapshot;
+use crate::model::Instrument;
 use crate::order_manager::OrderManager;
 use crate::portfolio::Portfolio;
 
@@ -35,6 +36,16 @@ pub struct EngineSnapshot {
     pub current_time: i64,
     pub portfolio: Portfolio,
     pub order_manager: OrderManager,
+    #[serde(default)]
+    pub last_prices: HashMap<String, Decimal>,
+    #[serde(default)]
+    pub instruments: HashMap<String, Instrument>,
+    #[serde(default)]
+    pub initial_cash: Option<Decimal>,
+    #[serde(default)]
+    pub margin_accrued_interest: Decimal,
+    #[serde(default)]
+    pub margin_daily_interest: Decimal,
     #[serde(default)]
     pub history_state: Option<HistoryBufferSnapshot>,
     #[serde(default)]
