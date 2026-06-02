@@ -6,7 +6,8 @@ from akquant.akquant import Bar
 from akquant.backtest import run_backtest
 from akquant.ml import SklearnAdapter
 from akquant.strategy import Strategy
-from sklearn.linear_model import LogisticRegression  # type: ignore
+from sklearn.linear_model import LogisticRegression
+
 
 
 class WalkForwardStrategy(Strategy):
@@ -158,9 +159,9 @@ class WalkForwardStrategy(Strategy):
 
 if __name__ == "__main__":
     # 生成合成数据
-    dates = pd.date_range(start="2023-01-01", periods=20000, freq="1min")
+    dates = pd.date_range(start="2023-01-01", periods=2000, freq="1min")
     # 随机漫步价格
-    price = 100 + np.cumsum(np.random.randn(20000))
+    price = 100 + np.cumsum(np.random.randn(2000))
     df = pd.DataFrame(
         {
             "timestamp": dates,
@@ -175,7 +176,7 @@ if __name__ == "__main__":
 
     # 运行回测
     print("Running Walk-Forward Validation Backtest...")
-    run_backtest(
+    result = run_backtest(
         data=df,
         strategy=WalkForwardStrategy,
         symbols="TEST",
@@ -184,3 +185,12 @@ if __name__ == "__main__":
         history_depth=60,  # Explicitly pass history depth to ensure engine enables it
     )
     print("Backtest finished.")
+
+    result.report(
+        filename="ex10_ml_walk_forward_report_1min.html",
+        title=f"ML Walk-Forward Validation ({"TEST"})",
+        market_data=df,
+        include_trade_kline=True
+    )
+    
+    print(f"\n报告已保存至: {"ex10_ml_walk_forward_report_1min.html"}")
