@@ -224,56 +224,11 @@ class DailyWaveStrategy(Strategy):
         self.log("策略运行结束")
 
 
-# ========== 运行回测 ==========
-def run_backtest_strategy():
-     # 1. 获取数据
-    symbol = "688690"  # 替换为你想测试的股票代码
-    start_date = "20210101" 
-    end_date = "20260527"
-    DATA_DIR = "tsdata"  # 数据存储目录
-    
-    print(f"正在获取 {symbol} 数据...")
-    
-    mytoken = os.getenv('TUSHARE_TOKEN')
-    print('TUSHARE_TOKEN set:', bool(mytoken))
-
-    manager = TushareStockDataManager(
-        token= mytoken,  # 替换为你的实际 Token # type: ignore
-        data_dir=DATA_DIR,
-        request_interval=1.5  # 请求间隔 1.5 秒
-    )
-    df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
-    
-    
-    print(f"数据获取成功，共 {len(df)} 条记录")
-    
-    # 确保数据按时间排序
-    df = df.sort_index()
-    
-    print(f"数据获取完成，共{len(df)}个交易日")
-    print(f"数据范围：{df.index[0]} 至 {df.index[-1]}")
-    
-    # 2. 运行回测
-    result = run_backtest(
-        strategy=DailyWaveStrategy,
-        data=df,
-        symbols=[symbol],
-        initial_cash=100000.0,      # 初始资金10万
-        commission_rate=0.0003,      # 万三佣金
-        slippage={'type': 'percent', 'value': 0.0002},  # 万分之2滑点
-        t_plus_one=True,             # A股T+1
-        #debug=False                  # 调试模式（开启会打印更多日志）
-    )
-    
-    
-    return result
-
-
 if __name__ == "__main__":
      # 1. 获取数据
     symbol = "688131"  # 替换为你想测试的股票代码
     start_date = "20210101" 
-    end_date = "20260527"
+    end_date = "20260601"
     DATA_DIR = "tsdata"  # 数据存储目录
     
     print(f"正在获取 {symbol} 数据...")
@@ -304,7 +259,7 @@ if __name__ == "__main__":
         symbols=[symbol],
         initial_cash=100000.0,      # 初始资金10万
         commission_rate=0.0003,      # 万三佣金
-        slippage={'type': 'percent', 'value': 0.0002},  # 万分之2滑点
+        slippage=0.0002,  # 万分之2滑点
         t_plus_one=True,             # A股T+1
         #debug=False                  # 调试模式（开启会打印更多日志）
     )
