@@ -2,31 +2,19 @@ import os
 
 import numpy as np
 import pandas as pd
-from typing import Any, cast
+from typing import Any, Tuple
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
 from akq_module_tusharedatamanager import TushareStockDataManager
+from datetime import datetime as dt  # 给 datetime 类起个别名
 import warnings
 warnings.filterwarnings('ignore')
 
 # 假设使用 AKQuant 框架（也可以独立运行）
-try:
-    from akquant.akquant import Bar
-    from akquant.backtest import run_backtest
-    from akquant.ml import SklearnAdapter
-    from akquant.strategy import Strategy
-except ImportError:
-    print("AKQuant not available, running in standalone mode")
-    # 定义简单的基类用于独立运行
-    class Strategy:
-        def __init__(self):
-            self.model = None
-            self.history = []
-        def buy(self, symbol, size): pass
-        def sell(self, symbol, size): pass
-        def get_history_df(self, n): return pd.DataFrame()
-        def set_history_depth(self, n): pass
+from akquant.akquant import Bar
+from akquant.backtest import run_backtest
+from akquant.ml import SklearnAdapter
+from akquant.strategy import Strategy
+
 
 
 class FourFactorMLStrategy(Strategy):
@@ -44,21 +32,35 @@ class FourFactorMLStrategy(Strategy):
             retrain_frequency: 重新训练的间隔（bar数）
         """
         super().__init__()
-        
+
         # 1. 初始化模型（使用随机森林，对非线性关系适应好）
-        self.model = RandomForestClassifier(
-            n_estimators=100,      # 100棵决策树
-            max_depth=5,           # 限制深度防过拟合
-            min_samples_split=20,  # 分裂所需最小样本数
-            random_state=42,
-            n_jobs=-1              # 并行计算
+        # 包在 Adapter 里
+        self.model = SklearnAdapter(
+            RandomForestClassifier(
+                n_estimators=100,
+                max_depth=5,
+                min_samples_split=20,
+                random_state=42,
+                n_jobs=-1
+            )
         )
         
+        # 配置框架自动管理滚动验证
+        self.model.set_validation(
+            method="walk_forward",
+            train_window=252,
+            test_window=50,
+            rolling_step=50,
+            frequency="1d",
+            verbose=True
+        )
+
         # 2. 策略参数
         self.retrain_frequency = retrain_frequency
         self.bar_count = 0
         self.last_train_bar = -retrain_frequency
-        self.min_history_for_train = 100  # 最少需要100根bar才能训练
+        self.min_history_for_train = 150  # 最少需要150根bar才能训练
+        self.reserve_ratio = 0.1  # 预留10%资金，避免全仓导致的手续费不足问题
         
         # 3. 用于滚动训练的历史数据存储
         self.history_data = []
@@ -70,8 +72,8 @@ class FourFactorMLStrategy(Strategy):
         self.volume_period = 20
         
         # 5. 信号阈值（概率大于阈值才交易，减少噪音）
-        self.buy_threshold = 0.65
-        self.sell_threshold = 0.35
+        self.buy_threshold = 0.55
+        self.sell_threshold = 0.45
         
         # 6. 日志变量
         self._last_prediction = None
@@ -83,74 +85,52 @@ class FourFactorMLStrategy(Strategy):
         print(f"  - Retrain frequency: {retrain_frequency} bars")
         print(f"  - Buy threshold: {self.buy_threshold}, Sell threshold: {self.sell_threshold}")
     
+    def on_start(self):
+        """策略启动时执行一次"""
+        #self.subscribe(self.symbol)  # 订阅标的
+        # warmup_period 已设置，无需再调用 set_history_depth
     
     def compute_factors(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        计算四个核心因子 + 扩展特征
-        
-        Args:
-            df: 包含 open, high, low, close, volume 的DataFrame
-            
-        Returns:
-            包含所有特征的DataFrame
-        """
+        """你的完整因子计算代码"""
         X = pd.DataFrame(index=df.index)
         
-        # ========== 因子1: 趋势动量 ==========
-        # 多周期收益率
+        # 动量因子
         for period in self.momentum_periods:
             X[f'momentum_{period}'] = df['close'].pct_change(period)
-        
-        # 价格相对于均线的位置（乖离率）
-        for period in self.momentum_periods:
             ma = df['close'].rolling(period).mean()
             X[f'bias_{period}'] = (df['close'] - ma) / ma
         
-        # ========== 因子2: RSI ==========
-        # 计算RSI
+        # RSI
         delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=self.rsi_period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=self.rsi_period).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(self.rsi_period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(self.rsi_period).mean()
         rs = gain / loss
         X['rsi'] = 100 - (100 / (1 + rs))
+        X['rsi_oversold'] = (X['rsi'] < 30).astype(int)
+        X['rsi_overbought'] = (X['rsi'] > 70).astype(int)
         
-        # RSI的极值信号（超买超卖）
-        X['rsi_oversold'] = (X['rsi'] < 30).astype(int)   # 超卖区域
-        X['rsi_overbought'] = (X['rsi'] > 70).astype(int) # 超买区域
-        
-        # ========== 因子3: ATR波动率 ==========
+        # ATR
         high_low = df['high'] - df['low']
         high_close = (df['high'] - df['close'].shift()).abs()
         low_close = (df['low'] - df['close'].shift()).abs()
         true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        X['atr'] = true_range.rolling(window=self.atr_period).mean()
-        
-        # 波动率变化率
+        X['atr'] = true_range.rolling(self.atr_period).mean()
         X['atr_pct_change'] = X['atr'].pct_change()
-        
-        # 标准化波动率（相对于过去均值）
         atr_ma = X['atr'].rolling(50).mean()
         X['atr_ratio'] = X['atr'] / atr_ma
         
-        # ========== 因子4: 成交量 ==========
+        # 成交量
         X['volume'] = df['volume']
         X['volume_ma_ratio'] = df['volume'] / df['volume'].rolling(self.volume_period).mean()
         X['volume_pct_change'] = df['volume'].pct_change()
-        
-        # 量价关系
         X['price_volume_corr'] = df['close'].pct_change().rolling(10).corr(df['volume'].pct_change())
         
-        # ========== 额外增强特征 ==========
-        # 当日涨跌幅
+        # 增强特征
         X['daily_return'] = df['close'].pct_change()
-        
-        # 振幅
         X['amplitude'] = (df['high'] - df['low']) / df['close']
-        
-        # 是否收涨
         X['is_up'] = (df['close'] > df['open']).astype(int)
         
-        # 连续上涨/下跌天数
+        # 连续涨跌天数
         X['consecutive_up'] = (X['daily_return'] > 0).astype(int).groupby(
             (X['daily_return'] <= 0).astype(int).cumsum()
         ).cumsum()
@@ -160,156 +140,112 @@ class FourFactorMLStrategy(Strategy):
         
         return X
     
-    
-    def prepare_data(self, df: pd.DataFrame) -> tuple:
+    def prepare_features(
+        self, df: pd.DataFrame, mode: str = "training"
+    ) -> Tuple[Any, Any]:
         """
-        准备训练数据：计算特征和标签
-        
-        Args:
-            df: 原始行情数据
-            
-        Returns:
-            (X, y) 特征矩阵和标签
+        准备特征和标签 - AKQuant 框架接口
         """
-        # 计算因子
+        # 计算特征
         X = self.compute_factors(df)
         
-        # 计算标签：预测下一日涨跌
-        # y = 1 表示下一日上涨，0 表示下跌
+        # 调试：打印数据形状
+        # if mode == "training":
+        #     print(f"  [调试] 原始数据形状: {df.shape}")
+        #     print(f"  [调试] X形状: {X.shape}, NaN数量: {X.isna().sum().sum()}")
+        
+        if mode == "inference":
+            X_curr = X.iloc[-1:].fillna(0)
+            return X_curr, None
+        
+        # ========== 训练模式 ==========
+        # 计算标签
         future_return = df['close'].pct_change().shift(-1)
         y = (future_return > 0).astype(int)
         
-        # 对齐数据：删除NaN行
-        valid_idx = X.dropna().index.intersection(y.dropna().index)
-        X_clean = X.loc[valid_idx]
-        y_clean = y.loc[valid_idx]
+        # 只保留有效特征行（至少有一列不是NaN）
+        X_clean = X.dropna(how='all')  # 删除全部为NaN的行
+        y_clean = y.loc[X_clean.index]  # 对齐
+        
+        # 再删除标签中的NaN
+        valid_idx = y_clean.dropna().index
+        X_clean = X_clean.loc[valid_idx]
+        y_clean = y_clean.loc[valid_idx]
+        
+        # 如果还有NaN，用前向填充
+        if X_clean.isna().any().any():
+            X_clean = X_clean.ffill().fillna(0)  # 或 X_clean.fillna(0)
+        
+        # 调试输出
+        # print(f"  [调试] 训练数据: X形状={X_clean.shape}, 正样本比例={y_clean.mean() if len(y_clean) > 0 else 0:.2%}")
+        
+        # 检查是否为空
+        if len(X_clean) == 0:
+            print(f"  [警告] 训练数据为空！请检查数据量是否足够")
+            # 返回空的 DataFrame 和 Series（但模型会报错，所以最好检查）
         
         return X_clean, y_clean
     
     
-    def train_model(self, df: pd.DataFrame) -> bool:
-        """
-        训练模型
-        
-        Args:
-            df: 历史行情数据
-            
-        Returns:
-            bool: 训练是否成功
-        """
-        if len(df) < self.min_history_for_train:
-            print(f"  训练数据不足: {len(df)} < {self.min_history_for_train}")
-            return False
-        
-        try:
-            # 准备数据
-            X, y = self.prepare_data(df)
-            
-            if len(X) < 50:
-                print(f"  有效样本不足: {len(X)}")
-                return False
-            
-            # 训练模型
-            self.model.fit(X, y)
-            
-            # 计算训练集准确率
-            train_pred = self.model.predict(X)
-            accuracy = accuracy_score(y, train_pred)
-            
-            print(f"  ✓ 模型训练完成: 样本数={len(X)}, 训练准确率={accuracy:.2%}")
-            
-            # 可选：打印特征重要性
-            if hasattr(self.model, 'feature_importances_'):
-                importance = pd.DataFrame({
-                    'feature': X.columns,
-                    'importance': self.model.feature_importances_
-                }).sort_values('importance', ascending=False)
-                print(f"  特征重要性 Top 5:")
-                for _, row in importance.head(5).iterrows():
-                    print(f"    - {row['feature']}: {row['importance']:.4f}")
-            
-            return True
-            
-        except Exception as e:
-            print(f"  ✗ 模型训练失败: {e}")
-            return False
-    
-    
-    def predict_next(self, df: pd.DataFrame) -> float:
-        """
-        预测下一日涨跌概率
-        
-        Args:
-            df: 包含历史数据的DataFrame
-            
-        Returns:
-            float: 上涨概率 (0-1)
-        """
-        if self.model is None:
-            return 0.5
-        
-        try:
-            # 计算最新一行的特征
-            X = self.compute_factors(df)
-            X_latest = X.iloc[-1:].fillna(0)
-            
-            # 预测概率
-            prob = self.model.predict_proba(X_latest)[0, 1]  # 上涨的概率
-            
-            return prob
-            
-        except Exception as e:
-            print(f"  预测失败: {e}")
-            return 0.5
-    
-    
-    def on_bar(self, bar: Any) -> None:
-        """
-        处理每个Bar的事件
-        """
+    def on_bar(self, bar: Bar):
+        """处理每个Bar"""
         self.bar_count += 1
         
-        # 获取历史数据
-        history_df = self.get_history_df(self.min_history_for_train + 100)
-        
-        if len(history_df) < self.min_history_for_train:
+        hist_df = self.get_history_df(count=200)
+        if len(hist_df) < 70:  # 增加最小数据要求
             return
         
-        # 定期重新训练模型
-        need_retrain = (self.bar_count - self.last_train_bar) >= self.retrain_frequency
-        
-        if need_retrain:
-            print(f"\n[Bar {self.bar_count}] 重新训练模型...")
-            if self.train_model(history_df):
-                self.last_train_bar = self.bar_count
-        
-        # 检查模型是否已训练
-        if not hasattr(self.model, 'predict_proba'):
+        if not self.is_model_ready():
             return
+    
+        # 直接尝试预测，如果模型未训练会抛异常
+        try:
+            X_curr, _ = self.prepare_features(hist_df, mode="inference")
+            
+            # 检查 X_curr 是否有效
+            if X_curr is None or len(X_curr) == 0:
+                return
+            
+            # 尝试预测
+            prob = self.model.predict(X_curr)
+            prob = prob[0] if isinstance(prob, (list, np.ndarray)) else prob
+            
+            # 打印预测结果（调试用，确认是否有输出）
+            # if self.bar_count >= 1020:  # 从第一个训练窗口开始打印
+            #     print(f"[Bar {self.bar_count}] 概率={prob:.2%}")
+            
+            # 交易逻辑
+            symbol = bar.symbol
+            current_pos = self.get_position(symbol)
         
-        # 预测
-        prob = self.predict_next(history_df)
-        
-        # 每20个bar打印一次预测（避免刷屏）
-        if self.bar_count % 20 == 0:
-            print(f"[Bar {self.bar_count}] 上涨概率: {prob:.2%}")
-        
-        # 交易逻辑
-        symbol = bar.symbol if hasattr(bar, 'symbol') else 'TEST'
-        
-        if prob > self.buy_threshold:
-            # 上涨概率高 -> 买入
-            self.buy(symbol, 100)
-            if self._last_prediction != 'buy':
-                print(f"  >>> 买入信号: 概率={prob:.2%} > {self.buy_threshold:.0%}")
-                self._last_prediction = 'buy'
-                
-        elif prob < self.sell_threshold:
-            # 上涨概率低 -> 卖出
-            self.sell(symbol, 100)
-            if self._last_prediction != 'sell':
-                print(f"  >>> 卖出信号: 概率={prob:.2%} < {self.sell_threshold:.0%}")
-                self._last_prediction = 'sell'
+            # 获取当前价格
+            current_price = bar.close
+            # 获取当前可用现金
+            cash = self.get_cash()
+            
+            # 预留部分资金（避免手续费不足）
+            available_cash = cash * (1 - self.reserve_ratio)
+            # 计算最大可买股数（向下取整到100的整数倍）
+            max_shares = int(available_cash / current_price / 100) * 100
+            
+            #全仓操作
+            if prob > self.buy_threshold:
+                if self.get_position(symbol) == 0:
+                    self.buy(symbol=symbol, quantity=max_shares)
+                    #self.buy_all(symbol=symbol)
+                    print(f">>> 买入! Bar={self.bar_count}, 概率={prob:.2%}")
+            elif prob < self.sell_threshold:
+                pos = self.get_position(symbol)
+                if pos > 0:
+                    #self.close_position(symbol=symbol)
+                    self.sell(symbol=symbol, quantity=pos)
+                    print(f">>> 卖出! Bar={self.bar_count}, 概率={prob:.2%}")
+                    
+        except Exception as e:
+            # 只在第一次出错时打印，避免刷屏
+            if not hasattr(self, '_error_printed'):
+                print(f"[首次错误] Bar {self.bar_count}: {e}")
+                self._error_printed = True
 
 # 获取真实A股数据的函数
 def get_real_stock_data(symbol="000001", start="2020-01-01", end="2024-12-31"):
@@ -358,30 +294,6 @@ def standalone_test():
     print("=" * 60)
     print("四因子机器学习策略 - 独立回测")
     print("=" * 60)
-    
-    # # 1. 生成模拟数据
-    # np.random.seed(42)
-    # n_days = 2000
-    # dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
-    
-    # # 生成随机游走价格
-    # returns = np.random.randn(n_days) * 0.02
-    # price = 100 * np.exp(np.cumsum(returns))
-    
-    # # 添加一些趋势和波动特征，使数据更真实
-    # trend = np.linspace(0, 0.3, n_days)  # 长期上涨趋势
-    # price = price * (1 + trend)
-    
-    # # 生成OHLC数据
-    # df = pd.DataFrame({
-    #     'date': dates,
-    #     'open': price * (1 + np.random.randn(n_days) * 0.005),
-    #     'high': price * (1 + np.abs(np.random.randn(n_days) * 0.01)),
-    #     'low': price * (1 - np.abs(np.random.randn(n_days) * 0.01)),
-    #     'close': price,
-    #     'volume': np.random.randint(1000, 10000, n_days),
-    #     'symbol': 'TEST'
-    # })
 
     # 1. 获取真实数据
     df = get_real_stock_data("688131", "2022-01-01", "2026-06-02")
@@ -504,10 +416,64 @@ def standalone_test():
     
     return results
 
-import akshare as ak
-
-
 
 if __name__ == "__main__":
     # 运行独立测试
-    results = standalone_test()
+    # results = standalone_test()
+    # 1. 获取数据
+    symbol = "688131"  # 替换为你想测试的股票代码
+    start_date = "20210101" 
+    end_date = "20260602"
+    DATA_DIR = "tsdata"  # 数据存储目录
+    
+    print(f"正在获取 {symbol} 数据...")
+    
+    mytoken = os.getenv('TUSHARE_TOKEN')
+    print('TUSHARE_TOKEN set:', bool(mytoken))
+
+    manager = TushareStockDataManager(
+        token= mytoken,  # 替换为你的实际 Token # type: ignore
+        data_dir=DATA_DIR,
+        request_interval=1.5  # 请求间隔 1.5 秒
+    )
+    df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
+    
+    
+    print(f"数据获取成功，共 {len(df)} 条记录")
+    
+    # 确保数据按时间排序
+    df = df.sort_index()
+    
+    print(f"数据获取完成，共{len(df)}个交易日")
+    print(f"数据范围：{df.index[0]} 至 {df.index[-1]}")
+    
+    # 2. 运行回测
+    result = run_backtest(
+        strategy=FourFactorMLStrategy,
+        data=df,
+        symbols=[symbol],
+        initial_cash=100000.0,      # 初始资金10万
+        commission_rate=0.0003,      # 万三佣金
+        slippage=0.0002,            # 万分之2滑点
+        t_plus_one=True,             # A股T+1
+        #debug=False                  # 调试模式（开启会打印更多日志）
+    )
+
+    # 4. 输出结果
+    print("\n=== 回测结果 ===")
+    print(result.metrics_df)
+    
+    # 5. 生成报告
+    report_dir = "./reports"
+    os.makedirs(report_dir, exist_ok=True)
+    timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+    report_path = f"{report_dir}/four_factor_ml_strategy_{symbol}_{timestamp}.html"
+    
+    result.report(
+        filename=report_path,
+        title=f"four_factor_ml策略报告 ({symbol})",
+        market_data=df,
+        include_trade_kline=True
+    )
+    
+    print(f"\n报告已保存至: {report_path}")
