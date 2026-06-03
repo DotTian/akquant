@@ -32,3 +32,8 @@ build/
 .cargo/config.toml
 /data_catalog/
 plans/
+
+# data and reports
+/data/
+/reports/
+/tsdata/
