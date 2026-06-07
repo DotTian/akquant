@@ -46,9 +46,10 @@ class DailyWaveStrategy(Strategy):
     def on_start(self):
         """策略启动时，订阅数据"""
         # 通过上下文获取配置信息
-        if hasattr(self.ctx, 'symbols') and self.ctx.symbols:
-            self.trade_symbol = self.ctx.symbols[0]
-            self.subscribe(self.trade_symbol)
+        # self.ctx.symbols 不存在
+        # if hasattr(self.ctx, 'symbols') and self.ctx.symbols:
+        #     self.trade_symbol = self.ctx.symbols[0]
+        #     self.subscribe(self.trade_symbol)
         
     
     # def _get_history(self, n=100, field="close"):
@@ -86,7 +87,9 @@ class DailyWaveStrategy(Strategy):
         }, index=dates)
         
         # 现在可以用了
-        df['week'] = df.index.isocalendar().week
+        # 确保 index 是 DatetimeIndex（避免 isocalendar 类型检查 warning）
+        df.index = pd.to_datetime(df.index)
+        df['week'] = df.index.isocalendar().week  # type: ignore
         weekly = df.groupby('week').agg({
             'close': 'last',
             'open': 'first',

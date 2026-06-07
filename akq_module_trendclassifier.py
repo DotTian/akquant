@@ -10,9 +10,21 @@
 
 import os
 
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.dates import DateFormatter
+import matplotlib.font_manager as fm
+import mplfinance as mpf
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+# ── 修复中文字体乱码 (Windows) ──
+plt.rcParams['font.sans-serif'] = [
+    'Microsoft YaHei', 'SimHei', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC', 'DejaVu Sans'
+]
+plt.rcParams['axes.unicode_minus'] = False  # 修复负号显示
+
 from typing import Tuple, Optional, List, Dict
 
 from akq_module_tusharedatamanager import TushareStockDataManager
@@ -352,36 +364,245 @@ class TrendClassifier:
         print("=" * 60)
 
 
+# ==================== 绘制函数 ====================
+def plot_trend_chart(df: pd.DataFrame,
+                    results_df: pd.DataFrame,
+                    symbol: str,
+                    save_path: Optional[str] = None):
+    """
+    绘制带趋势标注的日K线图
+
+    Parameters
+    ----------
+    df : 原始OHLC数据 (index 为日期)
+    results_df : classify 输出的结果 (columns: date, close, trend, confidence)
+    symbol : 股票代码
+    save_path : 保存路径，如果为 None 则显示
+    """
+    # 确保 df 的 index 是 DatetimeIndex
+    df = df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+
+    # 构建 trend map：date -> (trend, confidence)
+    trend_map = {}
+    for _, row in results_df.iterrows():
+        d = row['date']
+        if isinstance(d, pd.Timestamp):
+            d = d.strftime('%Y-%m-%d')
+        trend_map[d] = (row['trend'], row['confidence'])
+
+    # ── 准备 mplfinance addplot ──
+    addplots = []
+
+    # MA5
+    ma5 = df['close'].rolling(5).mean()
+    addplots.append(mpf.make_addplot(ma5, color='orange', width=0.8, label='MA5'))
+
+    # MA20
+    ma20 = df['close'].rolling(20).mean()
+    addplots.append(mpf.make_addplot(ma20, color='purple', width=0.8, label='MA20'))
+
+    # MA60
+    ma60 = df['close'].rolling(60).mean()
+    addplots.append(mpf.make_addplot(ma60, color='teal', width=0.8, label='MA60'))
+
+    # ── 构建趋势背景色标记 ──
+    # mplfinance 中通过 fill_between / vspan 等方式做背景不太方便，
+    # 这里采用 mplfinance + 外部 axvspan 的方式
+
+        # 先用 mplfinance 画 K 线（字体配置传入 style 防止被 mplfinance 覆盖）
+    mc = mpf.make_marketcolors(
+        up='red', down='green', edge='inherit', wick='inherit', volume='inherit'
+    )
+    style = mpf.make_mpf_style(
+        marketcolors=mc,
+        gridstyle=':',
+        y_on_right=False,
+        rc={
+            'font.sans-serif': ['Microsoft YaHei', 'SimHei', 'DejaVu Sans'],
+            'axes.unicode_minus': False,
+        }
+    )
+
+    fig, axes = mpf.plot(
+        df,
+        type='candle',
+        style=style,
+        addplot=addplots,
+        volume=True,
+        title=f"{symbol} 日K线图 + 趋势识别",
+        ylabel='价格',
+        ylabel_lower='成交量',
+        figratio=(18, 9),
+        figsize=(16, 8),
+        returnfig=True,
+        datetime_format='%Y-%m',
+        xrotation=30,
+    )
+
+    # ax 是第一个子图（K线图）
+    ax = axes[0]
+
+    # 颜色映射
+    trend_colors = {
+        'uptrend': '#4CAF50',    # 绿色
+        'downtrend': '#F44336',  # 红色
+        'range': '#FFC107',      # 黄色
+        'unknown': '#E0E0E0',    # 灰色
+    }
+
+    # 获取数据索引对应的 x 坐标
+    # mplfinance 的 x 轴是数值索引
+    x_index = np.arange(len(df))
+    x_to_date = dict(zip(x_index, df.index))
+    date_to_x = {}
+    for i, d in enumerate(df.index):
+        date_to_x[d.strftime('%Y-%m-%d')] = i
+
+    # 遍历每个交易日，用 axvspan 画出趋势区间
+    # 策略：连续相同趋势合并成一个区间
+    if len(results_df) > 0:
+        segments = []
+        current_trend = None
+        seg_start = None
+
+        for _, row in results_df.iterrows():
+            d = row['date']
+            trend = row['trend']
+            if isinstance(d, pd.Timestamp):
+                d_str = d.strftime('%Y-%m-%d')
+            else:
+                d_str = str(d)
+
+            if d_str not in date_to_x:
+                continue
+            x = date_to_x[d_str]
+
+            if trend != current_trend:
+                if current_trend is not None and seg_start is not None:
+                    segments.append((seg_start, x - 0.5, current_trend))
+                current_trend = trend
+                seg_start = max(0, x - 0.5)
+
+        # 最后一段
+        if current_trend is not None and seg_start is not None:
+            segments.append((seg_start, len(df) - 0.5, current_trend))
+
+        # 绘制半透明色块
+        for seg_start, seg_end, trend in segments:
+            color = trend_colors.get(trend, '#E0E0E0')
+            ax.axvspan(seg_start, seg_end, alpha=0.12, color=color, zorder=0)
+
+        # ── 添加趋势变化标记 ──
+        prev_trend = None
+        for _, row in results_df.iterrows():
+            d = row['date']
+            trend = row['trend']
+            confidence = row['confidence']
+            if isinstance(d, pd.Timestamp):
+                d_str = d.strftime('%Y-%m-%d')
+            else:
+                d_str = str(d)
+
+            if d_str not in date_to_x:
+                continue
+            x = date_to_x[d_str]
+            price = df.loc[df.index.strftime('%Y-%m-%d') == d_str, 'close']
+            if len(price) == 0:
+                continue
+            y_val = price.iloc[0]
+
+            # 只在趋势变化时标箭头（或者每 N 天标一次，避免过于密集）
+            if trend != prev_trend:
+                marker_color = trend_colors.get(trend, 'gray')
+                trend_cn = {'uptrend': '↑', 'downtrend': '↓', 'range': '→'}.get(trend, '')
+                ax.annotate(
+                    trend_cn,
+                    xy=(x, y_val),
+                    fontsize=14,
+                    fontweight='bold',
+                    color=marker_color,
+                    ha='center',
+                    va='bottom',
+                    xytext=(0, -18),
+                    textcoords='offset points',
+                    bbox=dict(
+                        boxstyle='round,pad=0.2',
+                        facecolor=marker_color,
+                        alpha=0.15,
+                        edgecolor='none'
+                    )
+                )
+            prev_trend = trend
+
+    # ── 图例 ──
+    handles = [
+        mpatches.Patch(color='#4CAF50', alpha=0.25, label='↑ 上升趋势'),
+        mpatches.Patch(color='#FFC107', alpha=0.25, label='→ 震荡'),
+        mpatches.Patch(color='#F44336', alpha=0.25, label='↓ 下降趋势'),
+    ]
+    ax.legend(
+        handles=handles,
+        loc='upper left',
+        fontsize=8,
+        framealpha=0.9,
+        title='趋势状态 (背景色)',
+        title_fontsize=9,
+    )
+
+    # ── 标题上加趋势统计 ──
+    uptrend_pct = (results_df['trend'] == 'uptrend').mean()
+    range_pct = (results_df['trend'] == 'range').mean()
+    downtrend_pct = (results_df['trend'] == 'downtrend').mean()
+    ax.set_title(
+        f"{symbol} 日K线 + 趋势识别\n"
+        f"[上升 {uptrend_pct:.0%} | 震荡 {range_pct:.0%} | 下降 {downtrend_pct:.0%}]\n"
+        f"{df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')}",
+        fontsize=12,
+    )
+
+    # ── 保存或显示 ──
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[图表已保存] {save_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
 # ==================== 使用示例 ====================
 if __name__ == "__main__":
     import akshare as ak
-    
+
     # 1. 获取数据
-    symbol = "000725"  # 替换为你想测试的股票代码
-    start_date = "20220101" 
-    end_date = "20260601"
+    symbol = "600863"  # 替换为你想测试的股票代码
+    start_date = "20250101"
+    end_date = "20260605"
     DATA_DIR = "tsdata"  # 数据存储目录
-    
+
     print(f"正在获取 {symbol} 数据...")
-    
+
     mytoken = os.getenv('TUSHARE_TOKEN')
     print('TUSHARE_TOKEN set:', bool(mytoken))
-    
+
     manager = TushareStockDataManager(
         token= mytoken,  # 替换为你的实际 Token # type: ignore
         data_dir=DATA_DIR,
         request_interval=1.5  # 请求间隔 1.5 秒
     )
     df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
-    
-    
+
+
     print(f"数据获取成功，共 {len(df)} 条记录")
-    
+
     print(f"数据范围: {df.index[0]} 至 {df.index[-1]}, 共{len(df)}个交易日")
-    
+
     # 创建分类器
     classifier = TrendClassifier()
-    
+
     # 分别判断每天的趋势（滚动窗口）
     results = []
     for i in range(60, len(df)):
@@ -389,7 +610,7 @@ if __name__ == "__main__":
         close = df['close'].iloc[:end_idx]
         high = df['high'].iloc[:end_idx]
         low = df['low'].iloc[:end_idx]
-        
+
         trend, confidence = classifier.classify(close, high, low)
         results.append({
             'date': df.index[i],
@@ -397,16 +618,16 @@ if __name__ == "__main__":
             'trend': trend,
             'confidence': confidence
         })
-    
+
     # 输出最近10天的结果
     results_df = pd.DataFrame(results)
     print("\n最近10天趋势判断:")
     print(results_df.tail(10).to_string())
-    
+
     # 统计各趋势占比
     print("\n趋势分布统计:")
     print(results_df['trend'].value_counts())
-    
+
     # 测试单次详细输出
     print("\n" + "=" * 60)
     print("单次详细识别示例（最后一天）:")
@@ -414,3 +635,10 @@ if __name__ == "__main__":
     last_high = df['high']
     last_low = df['low']
     trend, conf = classifier.classify(last_close, last_high, last_low, debug=True)
+
+    # ── 绘制带趋势标注的 K 线图 ──
+    print("\n正在生成趋势K线图...")
+    report_dir = "./reports"
+    os.makedirs(report_dir, exist_ok=True)
+    chart_path = f"{report_dir}/trend_chart_{symbol}_{start_date}_{end_date}.png"
+    plot_trend_chart(df, results_df, symbol, save_path=chart_path)
