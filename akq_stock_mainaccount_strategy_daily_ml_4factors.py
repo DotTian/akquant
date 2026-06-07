@@ -104,7 +104,8 @@ class FourFactorMLStrategy(Strategy):
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(self.rsi_period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(self.rsi_period).mean()
-        rs = gain / loss
+        loss_safe = loss.replace(0, np.nan)  # 避免除零导致 inf
+        rs = gain / loss_safe
         X['rsi'] = 100 - (100 / (1 + rs))
         X['rsi_oversold'] = (X['rsi'] < 30).astype(int)
         X['rsi_overbought'] = (X['rsi'] > 70).astype(int)
@@ -179,10 +180,10 @@ class FourFactorMLStrategy(Strategy):
         # 调试输出
         # print(f"  [调试] 训练数据: X形状={X_clean.shape}, 正样本比例={y_clean.mean() if len(y_clean) > 0 else 0:.2%}")
         
-        # 检查是否为空
+                # 检查是否为空
         if len(X_clean) == 0:
             print(f"  [警告] 训练数据为空！请检查数据量是否足够")
-            # 返回空的 DataFrame 和 Series（但模型会报错，所以最好检查）
+            return pd.DataFrame(), pd.Series(dtype=int)
         
         return X_clean, y_clean
     
@@ -332,8 +333,8 @@ def standalone_test():
         # 测试集
         test_df = df.iloc[i:i + test_window]
         
-        # 准备训练数据
-        X_train, y_train = strategy.prepare_data(train_df)
+                # 准备训练数据
+        X_train, y_train = strategy.prepare_features(train_df, mode="training")
         
         if len(X_train) < 50:
             continue
@@ -380,7 +381,10 @@ def standalone_test():
     print(f"预测次数: {len(predictions)}")
     print(f"买入信号次数: {sum(1 for p in positions if p == 1)}")
     print(f"卖出信号次数: {sum(1 for p in positions if p == -1)}")
-    print(f"平均预测概率: {np.mean(predictions):.2%}")
+    if predictions:
+        print(f"平均预测概率: {np.mean(predictions):.2%}")
+    else:
+        print("平均预测概率: 无数据")
     
     # 简单评估预测准确率
     # 获取实际收益率
@@ -421,8 +425,8 @@ if __name__ == "__main__":
     # 运行独立测试
     # results = standalone_test()
     # 1. 获取数据
-    symbol = "688131"  # 替换为你想测试的股票代码
-    start_date = "20210101" 
+    symbol = "600863"  # 替换为你想测试的股票代码
+    start_date = "20200101" 
     end_date = "20260602"
     DATA_DIR = "tsdata"  # 数据存储目录
     
