@@ -229,9 +229,9 @@ class DailyWaveStrategy(Strategy):
 
 if __name__ == "__main__":
      # 1. 获取数据
-    symbol = "688131"  # 替换为你想测试的股票代码
+    symbol = "301358"  # 替换为你想测试的股票代码
     start_date = "20210101" 
-    end_date = "20260601"
+    end_date = "20260617"
     DATA_DIR = "tsdata"  # 数据存储目录
     
     print(f"正在获取 {symbol} 数据...")

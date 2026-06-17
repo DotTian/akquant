@@ -17,7 +17,7 @@ from datetime import datetime
 import webbrowser
 import tushare as ts
 
-from akq_stock_mainaccount_strategy import stock_MainAccountStrategy
+from akq_stock_test_strategy import stock_MainAccountStrategy
 #from akq_stock_mainaccount_datamanager_ak import StockDataManagerak # akshare数据管理器
 #from akq_stock_mainaccount_datamanager_ts import StockDataManagerts # tushare数据管理器-临时不带文件存储
 from akq_module_tusharedatamanager import TushareStockDataManager # tushare数据管理器-带文件存储
