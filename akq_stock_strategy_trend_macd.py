@@ -120,30 +120,39 @@ class TrendMacdStrategy(Strategy):
             if current_price > self.highest_price_since_entry:
                 self.highest_price_since_entry = current_price
 
-            # ---- 止损 ----
-            loss_pct = (current_price - self.buy_price) / self.buy_price
-            if loss_pct <= self.stop_loss:
-                self.close_position(symbol)
-                self.log(f"[止损] 价格:{current_price:.2f}, 买入价:{self.buy_price:.2f}, 亏损:{loss_pct*100:.2f}%")
-                self._reset_state()
-                return
+            # 只有在有买入记录时才计算盈亏
+            if self.buy_price > 0:
+                loss_pct = (current_price - self.buy_price) / self.buy_price
 
-            # ---- 跟踪止盈 ----
-            if loss_pct >= self.take_profit_threshold:
-                # 从最高价回撤幅度
-                drawdown_pct = (self.highest_price_since_entry - current_price) / self.highest_price_since_entry
-                if drawdown_pct >= self.trailing_drawdown:
+                # ---- 止损 ----
+                if loss_pct <= self.stop_loss:
                     self.close_position(symbol)
-                    self.log(f"[跟踪止盈] 价格:{current_price:.2f}, "
-                             f"最高:{self.highest_price_since_entry:.2f}, "
-                             f"回撤:{drawdown_pct*100:.2f}%, 收益:{loss_pct*100:.2f}%")
+                    self.log(f"[止损] 价格:{current_price:.2f}, 买入价:{self.buy_price:.2f}, 亏损:{loss_pct*100:.2f}%")
                     self._reset_state()
                     return
 
-            # ---- 下降趋势内，MACD 死叉卖出 ----
-            if trend == "downtrend" and macd_today < signal_today and macd_yesterday >= signal_yesterday:
+                # ---- 跟踪止盈 ----
+                if loss_pct >= self.take_profit_threshold:
+                    # 从最高价回撤幅度
+                    drawdown_pct = (self.highest_price_since_entry - current_price) / self.highest_price_since_entry
+                    if drawdown_pct >= self.trailing_drawdown:
+                        self.close_position(symbol)
+                        self.log(f"[跟踪止盈] 价格:{current_price:.2f}, "
+                                    f"最高:{self.highest_price_since_entry:.2f}, "
+                                    f"回撤:{drawdown_pct*100:.2f}%, 收益:{loss_pct*100:.2f}%")
+                        self._reset_state()
+                        return
+
+                # ---- 下降趋势内，MACD 死叉卖出 ----
+                if trend == "downtrend" and macd_today < signal_today and macd_yesterday >= signal_yesterday:
+                    self.close_position(symbol)
+                    self.log(f"[趋势死叉卖出] 价格:{current_price:.2f}, MACD死叉, 收益:{loss_pct*100:.2f}%")
+                    self._reset_state()
+                    return
+            else:
+                # buy_price == 0 但还有持仓（异常情况），直接平仓
                 self.close_position(symbol)
-                self.log(f"[趋势死叉卖出] 价格:{current_price:.2f}, MACD死叉, 收益:{loss_pct*100:.2f}%")
+                self.log(f"[异常平仓] 价格:{current_price:.2f}, 买入价记录丢失")
                 self._reset_state()
                 return
 
@@ -179,8 +188,8 @@ class TrendMacdStrategy(Strategy):
 if __name__ == "__main__":
     # 1. 获取数据
     symbol = "300001"  # 测试股票代码
-    start_date = "20200101"
-    end_date = "20260617"
+    start_date = "20100101"
+    end_date = "20260616"
     DATA_DIR = "tsdata"
 
     print(f"获取 {symbol} 数据...")
