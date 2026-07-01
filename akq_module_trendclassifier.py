@@ -28,6 +28,7 @@ plt.rcParams['axes.unicode_minus'] = False  # 修复负号显示
 from typing import Tuple, Optional, List, Dict
 
 from akq_module_tusharedatamanager import TushareStockDataManager
+from akq_module_stockinfo import StockInfoManager
 
 
 class TrendClassifier:
@@ -368,7 +369,8 @@ class TrendClassifier:
 def plot_trend_chart(df: pd.DataFrame,
                     results_df: pd.DataFrame,
                     symbol: str,
-                    save_path: Optional[str] = None):
+                    save_path: Optional[str] = None,
+                    stock_name: Optional[str] = None):
     """
     绘制带趋势标注的日K线图
 
@@ -378,7 +380,10 @@ def plot_trend_chart(df: pd.DataFrame,
     results_df : classify 输出的结果 (columns: date, close, trend, confidence)
     symbol : 股票代码
     save_path : 保存路径，如果为 None 则显示
+    stock_name : 股票中文名称（可选），如果提供则显示在标题中
     """
+    # 显示用的标的名
+    display_name = f"{symbol} {stock_name}" if stock_name else symbol
     # 确保 df 的 index 是 DatetimeIndex
     df = df.copy()
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -431,7 +436,7 @@ def plot_trend_chart(df: pd.DataFrame,
         style=style,
         addplot=addplots,
         volume=True,
-        title=f"{symbol} 日K线图 + 趋势识别",
+        title=f"{display_name} 日K线图 + 趋势识别",
         ylabel='价格',
         ylabel_lower='成交量',
         figratio=(18, 9),
@@ -556,7 +561,7 @@ def plot_trend_chart(df: pd.DataFrame,
     range_pct = (results_df['trend'] == 'range').mean()
     downtrend_pct = (results_df['trend'] == 'downtrend').mean()
     ax.set_title(
-        f"{symbol} 日K线 + 趋势识别\n"
+        f"{display_name} 日K线 + 趋势识别\n"
         f"[上升 {uptrend_pct:.0%} | 震荡 {range_pct:.0%} | 下降 {downtrend_pct:.0%}]\n"
         f"{df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')}",
         fontsize=12,
@@ -591,11 +596,22 @@ if __name__ == "__main__":
         request_interval=1.5
     )
 
+    # 初始化股票信息管理器（获取中文名称）
+    stock_info = StockInfoManager(
+        token=mytoken,
+        data_dir="stock_info",
+        request_interval=1.2
+    )
+
     classifier = TrendClassifier()
 
     for symbol in symbols:
+        # 获取中文名称
+        cn_name = stock_info.get_stock_name(symbol)
+        display_label = f"{symbol} ({cn_name})" if cn_name else symbol
+
         print(f"\n{'='*60}")
-        print(f"正在获取 {symbol} 数据...")
+        print(f"正在获取 {display_label} 数据...")
         df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
 
         if df.empty:
@@ -623,27 +639,27 @@ if __name__ == "__main__":
 
         results_df = pd.DataFrame(results)
 
-        # 输出最近10天的结果
-        print(f"\n{symbol} 最近10天趋势判断:")
+        # 输出最近10天的结果（带中文名）
+        print(f"\n{display_label} 最近10天趋势判断:")
         print(results_df.tail(10).to_string())
 
         # 统计各趋势占比
-        print(f"\n{symbol} 趋势分布统计:")
+        print(f"\n{display_label} 趋势分布统计:")
         print(results_df['trend'].value_counts())
 
         # 测试单次详细输出（最后一天）
         print("\n" + "=" * 60)
-        print(f"{symbol} 单次详细识别示例（最后一天）:")
+        print(f"{display_label} 单次详细识别示例（最后一天）:")
         last_close = df['close']
         last_high = df['high']
         last_low = df['low']
         trend, conf = classifier.classify(last_close, last_high, last_low, debug=True)
 
-        # ── 绘制带趋势标注的 K 线图 ──
+        # ── 绘制带趋势标注的 K 线图（标题带中文名）──
         print(f"\n正在生成 {symbol} 趋势K线图...")
         os.makedirs(report_dir, exist_ok=True)
         chart_path = f"{report_dir}/trend_chart_{symbol}_{start_date}_{end_date}.png"
-        plot_trend_chart(df, results_df, symbol, save_path=chart_path)
+        plot_trend_chart(df, results_df, symbol, save_path=chart_path, stock_name=cn_name)
 
     print("\n" + "="*60)
     print("全部股票处理完成。")

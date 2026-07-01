@@ -31,6 +31,7 @@ plt.rcParams['axes.unicode_minus'] = False
 from typing import Tuple, Optional, List, Dict
 
 from akq_module_tusharedatamanager import TushareStockDataManager
+from akq_module_stockinfo import StockInfoManager
 
 
 class DivergenceDetector:
@@ -224,7 +225,8 @@ class DivergenceDetector:
 def plot_divergence_chart(df: pd.DataFrame,
                           divergences: List[Dict],
                           symbol: str,
-                          save_path: Optional[str] = None):
+                          save_path: Optional[str] = None,
+                          stock_name: Optional[str] = None):
     """
     绘制带背离标注的日K线图（包含MACD和成交量子图）
 
@@ -234,7 +236,10 @@ def plot_divergence_chart(df: pd.DataFrame,
     divergences : detect 返回的背离列表
     symbol : 股票代码
     save_path : 保存路径，如果为 None 则显示
+    stock_name : 股票中文名称（可选），如果提供则显示在标题中
     """
+    # 显示用的标的名
+    display_name = f"{symbol} {stock_name}" if stock_name else symbol
     df = df.copy()
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
@@ -287,7 +292,7 @@ def plot_divergence_chart(df: pd.DataFrame,
         style=style,
         addplot=all_plots,
         volume=False,  # 我们手动加了 volume 子图
-        title=f"{symbol} 日K线图 + 背离信号",
+        title=f"{display_name} 日K线图 + 背离信号",
         ylabel='价格',
         ylabel_lower='',
         figratio=(16, 10),
@@ -381,7 +386,7 @@ def plot_divergence_chart(df: pd.DataFrame,
     uptrend_pct = None
     # 可加统计信息
     ax_candle.set_title(
-        f"{symbol} 日K线 + 背离信号\n"
+        f"{display_name} 日K线 + 背离信号\n"
         f"共检测到 {len([d for d in divergences if d['type']=='top'])} 个顶背离, "
         f"{len([d for d in divergences if d['type']=='bottom'])} 个底背离\n"
         f"{df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')}",
@@ -405,7 +410,7 @@ def plot_divergence_chart(df: pd.DataFrame,
 # ==================== 使用示例 (main) ====================
 if __name__ == "__main__":
     # 1. 配置多个 symbol（可改为从外部传入或读取列表）
-    symbols = ["300724", "688270", "688690", "600989", "301358", "301393"]   # 可在此添加更多股票代码
+    symbols = ["300724", "688270", "688690", "600989", "301358", "301393"]
     start_date = "20250102"
     end_date = "20260701"
     DATA_DIR = "tsdata"
@@ -421,6 +426,13 @@ if __name__ == "__main__":
         request_interval=1.5
     )
 
+    # 初始化股票信息管理器（获取中文名称）
+    stock_info = StockInfoManager(
+        token=mytoken,
+        data_dir="stock_info",
+        request_interval=1.2
+    )
+
     # 创建背离检测器（参数可根据需要调整）
     detector = DivergenceDetector(
         extremum_order=5,
@@ -430,8 +442,12 @@ if __name__ == "__main__":
     results = {}   # symbol -> list of divergences
 
     for symbol in symbols:
+        # 获取中文名称
+        cn_name = stock_info.get_stock_name(symbol)
+        display_label = f"{symbol} ({cn_name})" if cn_name else symbol
+
         print(f"\n{'='*40}")
-        print(f"正在获取 {symbol} 数据...")
+        print(f"正在获取 {display_label} 数据...")
         df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
 
         if df.empty:
@@ -452,23 +468,25 @@ if __name__ == "__main__":
         )
         results[symbol] = divergences
 
-        # 输出结果
-        print(f"\n{symbol} 背离信号明细:")
+        # 输出结果（带中文名）
+        print(f"\n{display_label} 背离信号明细:")
         for d in divergences:
             print(f"  {d['date'].strftime('%Y-%m-%d')} | {d['type']} | {d['subtype']} | 价格:{d['price']:.2f} | 置信度:{d['confidence']:.0%}")
 
-        # 绘制图表（每只股票独立保存）
+        # 绘制图表（每只股票独立保存，标题带中文名）
         print(f"\n正在生成 {symbol} K线图...")
         os.makedirs(report_dir, exist_ok=True)
         chart_path = f"{report_dir}/divergence_chart_{symbol}_{start_date}_{end_date}.png"
-        plot_divergence_chart(df, divergences, symbol, save_path=chart_path)
+        plot_divergence_chart(df, divergences, symbol, save_path=chart_path, stock_name=cn_name)
 
-    # 汇总统计
+    # 汇总统计（带中文名）
     print("\n" + "="*60)
     print("所有股票背离统计:")
     print("="*60)
     for sym, divs in results.items():
+        cn_name = stock_info.get_stock_name(sym)
+        display_label = f"{sym} ({cn_name})" if cn_name else sym
         top = len([d for d in divs if d['type'] == 'top'])
         bot = len([d for d in divs if d['type'] == 'bottom'])
-        print(f"  {sym}: {top} 个顶背离, {bot} 个底背离")
+        print(f"  {display_label}: {top} 个顶背离, {bot} 个底背离")
     print("="*60)
