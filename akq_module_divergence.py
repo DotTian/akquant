@@ -404,14 +404,14 @@ def plot_divergence_chart(df: pd.DataFrame,
 
 # ==================== 使用示例 (main) ====================
 if __name__ == "__main__":
-    # 1. 获取数据
-    symbol = "688131"
-    start_date = "20250101"
-    end_date = "20260621"
+    # 1. 配置多个 symbol（可改为从外部传入或读取列表）
+    symbols = ["300724", "688270", "688690", "600989", "301358", "301393"]   # 可在此添加更多股票代码
+    start_date = "20250102"
+    end_date = "20260701"
     DATA_DIR = "tsdata"
+    report_dir = "./reports"
 
-    print(f"正在获取 {symbol} 数据...")
-
+    print(f"开始处理 {len(symbols)} 只股票...")
     mytoken = os.getenv('TUSHARE_TOKEN')
     print('TUSHARE_TOKEN set:', bool(mytoken))
 
@@ -420,36 +420,55 @@ if __name__ == "__main__":
         data_dir=DATA_DIR,
         request_interval=1.5
     )
-    df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
 
-    print(f"数据获取成功，共 {len(df)} 条记录")
-    print(f"数据范围: {df.index[0]} 至 {df.index[-1]}")
-
-    # 2. 创建背离检测器
+    # 创建背离检测器（参数可根据需要调整）
     detector = DivergenceDetector(
-        extremum_order=5,        # 左右各5根K线确定局部极值
+        extremum_order=5,
         volume_confirm_ratio=0.95
     )
 
-    # 3. 运行检测
-    # 需要足够的预热数据（至少包含MACD计算所需的26+9个周期）
-    # 但检测器内部会从极值点开始，所以我们全部传入
-    divergences = detector.detect(
-        close=df['close'],
-        high=df['high'],
-        low=df['low'],
-        volume=df['volume'],
-        debug=True
-    )
+    results = {}   # symbol -> list of divergences
 
-    # 4. 输出结果
-    print("\n背离信号明细:")
-    for d in divergences:
-        print(f"{d['date'].strftime('%Y-%m-%d')} | {d['type']} | {d['subtype']} | 价格:{d['price']:.2f} | 置信度:{d['confidence']:.0%}")
+    for symbol in symbols:
+        print(f"\n{'='*40}")
+        print(f"正在获取 {symbol} 数据...")
+        df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
 
-    # 5. 绘制图表
-    print("\n正在生成背离信号K线图...")
-    report_dir = "./reports"
-    os.makedirs(report_dir, exist_ok=True)
-    chart_path = f"{report_dir}/divergence_chart_{symbol}_{start_date}_{end_date}.png"
-    plot_divergence_chart(df, divergences, symbol, save_path=chart_path)
+        if df.empty:
+            print(f"警告: {symbol} 未获取到数据，跳过")
+            results[symbol] = []
+            continue
+
+        print(f"数据获取成功，共 {len(df)} 条记录")
+        print(f"数据范围: {df.index[0]} 至 {df.index[-1]}")
+
+        # 运行检测
+        divergences = detector.detect(
+            close=df['close'],
+            high=df['high'],
+            low=df['low'],
+            volume=df['volume'],
+            debug=True
+        )
+        results[symbol] = divergences
+
+        # 输出结果
+        print(f"\n{symbol} 背离信号明细:")
+        for d in divergences:
+            print(f"  {d['date'].strftime('%Y-%m-%d')} | {d['type']} | {d['subtype']} | 价格:{d['price']:.2f} | 置信度:{d['confidence']:.0%}")
+
+        # 绘制图表（每只股票独立保存）
+        print(f"\n正在生成 {symbol} K线图...")
+        os.makedirs(report_dir, exist_ok=True)
+        chart_path = f"{report_dir}/divergence_chart_{symbol}_{start_date}_{end_date}.png"
+        plot_divergence_chart(df, divergences, symbol, save_path=chart_path)
+
+    # 汇总统计
+    print("\n" + "="*60)
+    print("所有股票背离统计:")
+    print("="*60)
+    for sym, divs in results.items():
+        top = len([d for d in divs if d['type'] == 'top'])
+        bot = len([d for d in divs if d['type'] == 'bottom'])
+        print(f"  {sym}: {top} 个顶背离, {bot} 个底背离")
+    print("="*60)

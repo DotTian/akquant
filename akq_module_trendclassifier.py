@@ -575,70 +575,76 @@ def plot_trend_chart(df: pd.DataFrame,
 
 # ==================== 使用示例 ====================
 if __name__ == "__main__":
-    import akshare as ak
-
-    # 1. 获取数据
-    symbol = "600863"  # 替换为你想测试的股票代码
-    start_date = "20250101"
-    end_date = "20260605"
-    DATA_DIR = "tsdata"  # 数据存储目录
-
-    print(f"正在获取 {symbol} 数据...")
+    # 配置多个 symbol
+    symbols = ["300724", "688270", "688690", "600989", "301358", "301393"]   # 可在此添加更多股票代码
+    start_date = "20260101"
+    end_date = "20260701"
+    DATA_DIR = "tsdata"
+    report_dir = "./reports"
 
     mytoken = os.getenv('TUSHARE_TOKEN')
     print('TUSHARE_TOKEN set:', bool(mytoken))
 
     manager = TushareStockDataManager(
-        token= mytoken,  # 替换为你的实际 Token # type: ignore
+        token=mytoken,
         data_dir=DATA_DIR,
-        request_interval=1.5  # 请求间隔 1.5 秒
+        request_interval=1.5
     )
-    df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
 
-
-    print(f"数据获取成功，共 {len(df)} 条记录")
-
-    print(f"数据范围: {df.index[0]} 至 {df.index[-1]}, 共{len(df)}个交易日")
-
-    # 创建分类器
     classifier = TrendClassifier()
 
-    # 分别判断每天的趋势（滚动窗口）
-    results = []
-    for i in range(60, len(df)):
-        end_idx = i + 1
-        close = df['close'].iloc[:end_idx]
-        high = df['high'].iloc[:end_idx]
-        low = df['low'].iloc[:end_idx]
+    for symbol in symbols:
+        print(f"\n{'='*60}")
+        print(f"正在获取 {symbol} 数据...")
+        df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
 
-        trend, confidence = classifier.classify(close, high, low)
-        results.append({
-            'date': df.index[i],
-            'close': close.iloc[-1],
-            'trend': trend,
-            'confidence': confidence
-        })
+        if df.empty:
+            print(f"警告: {symbol} 未获取到数据，跳过")
+            continue
 
-    # 输出最近10天的结果
-    results_df = pd.DataFrame(results)
-    print("\n最近10天趋势判断:")
-    print(results_df.tail(10).to_string())
+        print(f"数据获取成功，共 {len(df)} 条记录")
+        print(f"数据范围: {df.index[0]} 至 {df.index[-1]}, 共{len(df)}个交易日")
 
-    # 统计各趋势占比
-    print("\n趋势分布统计:")
-    print(results_df['trend'].value_counts())
+        # 分别判断每天的趋势（滚动窗口）
+        results = []
+        for i in range(60, len(df)):
+            end_idx = i + 1
+            close = df['close'].iloc[:end_idx]
+            high = df['high'].iloc[:end_idx]
+            low = df['low'].iloc[:end_idx]
 
-    # 测试单次详细输出
-    print("\n" + "=" * 60)
-    print("单次详细识别示例（最后一天）:")
-    last_close = df['close']
-    last_high = df['high']
-    last_low = df['low']
-    trend, conf = classifier.classify(last_close, last_high, last_low, debug=True)
+            trend, confidence = classifier.classify(close, high, low)
+            results.append({
+                'date': df.index[i],
+                'close': close.iloc[-1],
+                'trend': trend,
+                'confidence': confidence
+            })
 
-    # ── 绘制带趋势标注的 K 线图 ──
-    print("\n正在生成趋势K线图...")
-    report_dir = "./reports"
-    os.makedirs(report_dir, exist_ok=True)
-    chart_path = f"{report_dir}/trend_chart_{symbol}_{start_date}_{end_date}.png"
-    plot_trend_chart(df, results_df, symbol, save_path=chart_path)
+        results_df = pd.DataFrame(results)
+
+        # 输出最近10天的结果
+        print(f"\n{symbol} 最近10天趋势判断:")
+        print(results_df.tail(10).to_string())
+
+        # 统计各趋势占比
+        print(f"\n{symbol} 趋势分布统计:")
+        print(results_df['trend'].value_counts())
+
+        # 测试单次详细输出（最后一天）
+        print("\n" + "=" * 60)
+        print(f"{symbol} 单次详细识别示例（最后一天）:")
+        last_close = df['close']
+        last_high = df['high']
+        last_low = df['low']
+        trend, conf = classifier.classify(last_close, last_high, last_low, debug=True)
+
+        # ── 绘制带趋势标注的 K 线图 ──
+        print(f"\n正在生成 {symbol} 趋势K线图...")
+        os.makedirs(report_dir, exist_ok=True)
+        chart_path = f"{report_dir}/trend_chart_{symbol}_{start_date}_{end_date}.png"
+        plot_trend_chart(df, results_df, symbol, save_path=chart_path)
+
+    print("\n" + "="*60)
+    print("全部股票处理完成。")
+    print("="*60)

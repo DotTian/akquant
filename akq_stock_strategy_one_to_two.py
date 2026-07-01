@@ -16,9 +16,26 @@ logger = logging.getLogger(__name__)
 
 
 class OneToTwoStrategy(Strategy):
-    """
-    一进二策略（仅依赖日线数据）
-    """
+    class OneToTwoStrategy(Strategy):
+        """
+        一进二策略（仅依赖日线数据）
+        核心逻辑（一进二打板）：
+        ------------------------
+        1. 首板确认：昨日收盘价涨停（根据板块区分涨跌幅：主板10%，双创20%，北交所30%）
+        2. 排除一字板：昨日开盘即涨停且最低==最高 → 判定为一字板，跳过
+        3. 次日买入条件：
+        - 高开 3%~7%（参数 high_open_range）
+        - 开盘未涨停（否则买不到）
+        - 今日成交量 ≥ 昨日成交量 × 0.8（参数 volume_ratio_min）
+        4. 卖出规则：
+        - 止损：当日最低价 ≤ 买入价 × 0.95（参数 stop_loss_pct = -5%）
+        - 涨停继续持有
+        - 未涨停则尾盘卖出（T+1规则，当日买入不可当日卖）
+        5. 资金管理：
+        - 每只股票仓位 20%（参数 position_pct）
+        - 最大持仓 5 只（参数 max_positions）
+        - 通过 order_target_percent 下单
+        """
 
     def __init__(self,
                  high_open_range: Tuple[float, float] = (0.03, 0.07),
