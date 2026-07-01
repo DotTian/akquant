@@ -465,7 +465,7 @@ def plot_trend_chart(df: pd.DataFrame,
     for i, d in enumerate(df.index):
         date_to_x[d.strftime('%Y-%m-%d')] = i
 
-    # 遍历每个交易日，用 axvspan 画出趋势区间
+            # 遍历每个交易日，用 axvspan 画出趋势区间
     # 策略：连续相同趋势合并成一个区间
     if len(results_df) > 0:
         segments = []
@@ -494,13 +494,15 @@ def plot_trend_chart(df: pd.DataFrame,
         if current_trend is not None and seg_start is not None:
             segments.append((seg_start, len(df) - 0.5, current_trend))
 
-        # 绘制半透明色块
+        # 绘制半透明色块（zorder=3 确保显示在K线之上）
         for seg_start, seg_end, trend in segments:
             color = trend_colors.get(trend, '#E0E0E0')
-            ax.axvspan(seg_start, seg_end, alpha=0.12, color=color, zorder=0)
+            ax.axvspan(seg_start, seg_end, alpha=0.35, color=color, zorder=3, edgecolor=color, linewidth=0.5)
 
-        # ── 添加趋势变化标记 ──
+        # ── 添加趋势变化标记（显示在成交量子图上方，不干扰K线） ──
         prev_trend = None
+        # 获取成交量子图（mplfinance 返回 axes: [0]=K线, [2]=成交量）
+        ax_vol = axes[2]
         for _, row in results_df.iterrows():
             d = row['date']
             trend = row['trend']
@@ -513,24 +515,22 @@ def plot_trend_chart(df: pd.DataFrame,
             if d_str not in date_to_x:
                 continue
             x = date_to_x[d_str]
-            price = df.loc[df.index.strftime('%Y-%m-%d') == d_str, 'close']
-            if len(price) == 0:
-                continue
-            y_val = price.iloc[0]
 
-            # 只在趋势变化时标箭头（或者每 N 天标一次，避免过于密集）
+            # 只在趋势变化时标注，显示在成交量图上
             if trend != prev_trend:
                 marker_color = trend_colors.get(trend, 'gray')
                 trend_cn = {'uptrend': '↑', 'downtrend': '↓', 'range': '→'}.get(trend, '')
-                ax.annotate(
-                    trend_cn,
-                    xy=(x, y_val),
-                    fontsize=14,
+                label = f"{trend_cn} {confidence:.0%}" if confidence > 0 else trend_cn
+                y_vol_top = ax_vol.get_ylim()[1]
+                ax_vol.annotate(
+                    label,
+                    xy=(x, y_vol_top),
+                    fontsize=9,
                     fontweight='bold',
                     color=marker_color,
                     ha='center',
                     va='bottom',
-                    xytext=(0, -18),
+                    xytext=(0, 6),
                     textcoords='offset points',
                     bbox=dict(
                         boxstyle='round,pad=0.2',
@@ -581,7 +581,7 @@ def plot_trend_chart(df: pd.DataFrame,
 # ==================== 使用示例 ====================
 if __name__ == "__main__":
     # 配置多个 symbol
-    symbols = ["300724", "688270", "688690", "600989", "301358", "301393"]   # 可在此添加更多股票代码
+    symbols = ["300724", "688270"]   # 可在此添加更多股票代码
     start_date = "20260101"
     end_date = "20260701"
     DATA_DIR = "tsdata"
