@@ -498,7 +498,7 @@ if __name__ == "__main__":
         exit(1)
 
     # 示例 symbols
-    symbols = ["300724", "688270", "688690", "600989", "301358", "301393"]
+    symbols = ["300724", "688270", "688690", "688131", "301358", "002487"]
     start_date = "20260101"
 
     generator = DailyReportGenerator(
