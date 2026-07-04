@@ -251,7 +251,7 @@ class TushareStockDataManager:
             except Exception as e:
                 logger.warning(f"获取失败 (尝试 {attempt+1}/{max_retries}): {symbol}, 错误: {e}")
                 if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 3  # 3, 6, 9 秒
+                    wait_time = (attempt + 1) * 1  # 1, 2, 3 秒
                     logger.info(f"等待 {wait_time} 秒后重试...")
                     time.sleep(wait_time)
                 else:
