@@ -174,13 +174,13 @@ class FundamentalsManager:
                 fields='ts_code,trade_date,pe_ttm'
             )
             if df_db is None or df_db.empty:
-                return None
+                return None, None
             pe_ttm = df_db.iloc[0].get('pe_ttm')
             if not pe_ttm or pe_ttm <= 0:
-                return None
+                return None, None
         except Exception as e:
             logger.warning(f"获取 {symbol} PE_TTM 失败: {e}")
-            return None
+            return None, None
 
         # 净利润增长率
         growth = self._calc_ttm_growth(symbol)
@@ -194,14 +194,14 @@ class FundamentalsManager:
                     growth = float(g)
 
         if not growth or growth <= 0:
-            return None
+            return None, None
 
         try:
             # Tushare 的 growth 字段已是百分比数值（如 15 表示 15%），无需再 ×100
             peg = float(pe_ttm) / float(growth)
-            return round(peg, 2)
+            return round(peg, 2), round(growth, 2)
         except (ZeroDivisionError, ValueError):
-            return None
+            return None, None
 
     def _calc_ttm_growth(self, symbol: str) -> Optional[float]:
         """基于 income 表计算滚动12个月净利润同比增长率"""
