@@ -22,6 +22,7 @@
 import base64
 import io
 import os
+import platform
 import sys
 import logging
 import tempfile
@@ -267,8 +268,11 @@ class DailyReportGenerator:
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            # 设置中文字体（绘图函数内已设置，但确保 mplfinance 不覆盖）
-            plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
+            # 设置中文字体（自动适配 Windows / Linux）
+            if platform.system() == 'Windows':
+                plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+            else:
+                plt.rcParams['font.sans-serif'] = ['WenQuanYi Zen Hei', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC', 'DejaVu Sans']
             plt.rcParams['axes.unicode_minus'] = False
 
             plot_divergence_chart(
@@ -306,7 +310,11 @@ class DailyReportGenerator:
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
+            # 设置中文字体（自动适配 Windows / Linux）
+            if platform.system() == 'Windows':
+                plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+            else:
+                plt.rcParams['font.sans-serif'] = ['WenQuanYi Zen Hei', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC', 'DejaVu Sans']
             plt.rcParams['axes.unicode_minus'] = False
 
             plot_trend_chart(
@@ -499,13 +507,13 @@ if __name__ == "__main__":
 
     # 示例 symbols
     symbols = ["300724", "688270", "688690", "688131", "301358", "002487"]
-    start_date = "20260101"
+    start_date = "20260105"
 
     generator = DailyReportGenerator(
         token=token,
         data_dir="tsdata",
         stock_info_dir="stock_info",
-        request_interval=1.5
+        request_interval=0.5
     )
 
     # 生成带日期时间的报告文件名

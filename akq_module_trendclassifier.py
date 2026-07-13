@@ -9,6 +9,7 @@
 """
 
 import os
+import platform
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -19,10 +20,14 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-# ── 修复中文字体乱码 (Windows) ──
-plt.rcParams['font.sans-serif'] = [
-    'Microsoft YaHei', 'SimHei', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC', 'DejaVu Sans'
-]
+# ── 修复中文字体乱码（自动适配 Windows / Linux）──
+def _get_cjk_fonts():
+    if platform.system() == 'Windows':
+        return ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+    else:
+        return ['WenQuanYi Zen Hei', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC', 'DejaVu Sans']
+
+plt.rcParams['font.sans-serif'] = _get_cjk_fonts()
 plt.rcParams['axes.unicode_minus'] = False  # 修复负号显示
 
 from typing import Tuple, Optional, List, Dict
@@ -424,8 +429,14 @@ def plot_trend_chart(df: pd.DataFrame,
         marketcolors=mc,
         gridstyle=':',
         y_on_right=False,
+        # windows 字体
+        # rc={
+        #     'font.sans-serif': ['Microsoft YaHei', 'SimHei', 'DejaVu Sans'],
+        #     'axes.unicode_minus': False,
+        # }
+        # 修改后 Linux 字体
         rc={
-            'font.sans-serif': ['Microsoft YaHei', 'SimHei', 'DejaVu Sans'],
+            'font.sans-serif': _get_cjk_fonts(),
             'axes.unicode_minus': False,
         }
     )
@@ -582,7 +593,7 @@ def plot_trend_chart(df: pd.DataFrame,
 if __name__ == "__main__":
     # 配置多个 symbol
     symbols = ["300724", "688270"]   # 可在此添加更多股票代码
-    start_date = "20260101"
+    start_date = "20260105"
     end_date = "20260701"
     DATA_DIR = "tsdata"
     report_dir = "./reports"
