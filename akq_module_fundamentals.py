@@ -59,10 +59,10 @@ class FundamentalsManager:
         path = self.cache_dir / f"{key}.parquet"
         if not path.exists():
             return None
-        # 缓存有效期 24 小时
-        mtime = datetime.fromtimestamp(path.stat().st_mtime)
-        if datetime.now() - mtime > timedelta(hours=24):
-            return None
+        # 缓存有效期 24 小时 - 永久有效，不自动过期（需手动清除缓存目录来强制更新）
+        # mtime = datetime.fromtimestamp(path.stat().st_mtime)
+        # if datetime.now() - mtime > timedelta(hours=24):
+        #     return None
         try:
             return pd.read_parquet(path)
         except Exception:

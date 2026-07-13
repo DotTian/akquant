@@ -49,9 +49,7 @@ logger = logging.getLogger(__name__)
 # 默认医药相关行业列表（可通过 discover_industries() 动态发现后确认）
 # ============================================================================
 DEFAULT_MEDICAL_INDUSTRIES = [
-    '化学制药', '生物制药', '医疗保健', '医药商业', '医疗器械',
-    '中药', '医药', '医疗服务', '医药流通', '疫苗', '创新药',
-    '原料药', '血液制品', '体外诊断', '基因测序', 'CRO',
+    '医疗保健', '化学制药', '生物制药', '医药商业',
 ]
 
 
@@ -76,7 +74,7 @@ class StockSelector:
         token: str,
         industries: Optional[List[str]] = None,
         data_dir: str = 'selector_data',
-        request_interval: float = 1.2,
+        request_interval: float = 0.05,
     ):
         self.token = token
         self.industries = industries or DEFAULT_MEDICAL_INDUSTRIES
@@ -115,6 +113,7 @@ class StockSelector:
         self._daily_basic_cache: Dict[str, pd.DataFrame] = {}
         self._pledge_cache: Dict[str, Optional[float]] = {}
         self._bs_cache: Dict[str, pd.DataFrame] = {}
+        self._listing_status_cache: Dict[str, dict] = {}
 
         logger.info(
             f'StockSelector 初始化完成，目标行业: {len(self.industries)} 个'
@@ -143,9 +142,7 @@ class StockSelector:
         p = self._cache_path(key)
         if not p.exists():
             return None
-        mtime = datetime.fromtimestamp(p.stat().st_mtime)
-        if datetime.now() - mtime > timedelta(hours=24):
-            return None
+        # 永久有效，不自动过期（需手动清除缓存目录来强制更新）
         try:
             return pd.read_parquet(p)
         except Exception:
@@ -273,6 +270,34 @@ class StockSelector:
         if len(pe) < 20:
             return None
         return float(np.percentile(pe, 80))
+
+    def _calculate_peg(self, symbol: str, pe_ttm: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+        """
+        计算 PEG = PE_TTM / 净利润增长率。
+        pe_ttm 从外部统一传入（避免内部再调 get_current_pe_ttm）。
+        """
+        if pe_ttm is None:
+            return None, None
+
+        # 净利润同比增长率（复用 FundamentalsManager 的 TTM 增长计算）
+        growth = self.fm._calc_ttm_growth(symbol)
+        if growth is None:
+            # 回退到单季同比
+            df_fina = self.fm.get_fina_indicator(symbol)
+            if df_fina is not None and not df_fina.empty:
+                latest = df_fina.sort_values('end_date', ascending=False).iloc[0]
+                g = latest.get('q_profit_yoy')
+                if g is not None and pd.notna(g):
+                    growth = float(g)
+
+        if growth is None or growth <= 0:
+            return None, None
+
+        try:
+            peg = round(float(pe_ttm) / float(growth), 2)
+            return peg, round(float(growth), 2)
+        except (ZeroDivisionError, ValueError):
+            return None, None
 
     def get_pledge_ratio(self, symbol: str) -> Optional[float]:
         """全体股东质押比例 (%)"""
@@ -417,9 +442,10 @@ class StockSelector:
         if len(df) < n_days * 0.8:  # 至少 80% 数据
             return None, None
 
-        # 成交额 = volume × close（粗略，单位：元）
+        # 成交额 = volume(手) × 100 × close (单位：元)
+        # Tushare 的 vol 字段单位是「手」，需要 ×100 转换为「股」
         if 'volume' in df.columns and 'close' in df.columns:
-            avg_amount = (df['volume'] * df['close']).mean()
+            avg_amount = (df['volume'] * 100 * df['close']).mean()
             avg_amount_wan = round(float(avg_amount) / 10000, 2)  # 万元
         else:
             avg_amount_wan = None
@@ -455,6 +481,62 @@ class StockSelector:
         if ni is not None and pd.notna(ni):
             return float(ni) < 0
         return None
+
+    # ========================================================================
+    # ST/退市检查（独立实现，带频率控制 + 内存缓存 + 磁盘缓存）
+    # ========================================================================
+    def _get_listing_status(self, symbol: str) -> dict:
+        """
+        检查 ST 及退市状态，带频率控制 + 内存缓存 + 磁盘缓存。
+        """
+        # 1. 内存缓存
+        if symbol in self._listing_status_cache:
+            return self._listing_status_cache[symbol]
+
+        # 2. 磁盘缓存
+        ck = f'listing_status_{symbol}'
+        cached = self._load_pickle_cache(ck)
+        if cached is not None and not cached.empty:
+            result = {
+                'is_st': bool(cached.iloc[0].get('is_st', False)),
+                'st_reason': str(cached.iloc[0].get('st_reason', '')),
+                'is_delisted': bool(cached.iloc[0].get('is_delisted', False)),
+                'delist_date': str(cached.iloc[0].get('delist_date', '')),
+            }
+            self._listing_status_cache[symbol] = result
+            return result
+
+        # 3. 调 API
+        ts_code = self._to_ts_code(symbol)
+        result = {'is_st': False, 'st_reason': '', 'is_delisted': False, 'delist_date': ''}
+
+        self._wait()
+        try:
+            nc = self.pro.namechange(ts_code=ts_code)
+            if nc is not None and not nc.empty:
+                st_rows = nc[nc['name'].str.contains(r'ST', regex=True)]
+                if not st_rows.empty:
+                    result['is_st'] = True
+                    latest = st_rows.sort_values('ann_date', ascending=False).iloc[0]
+                    result['st_reason'] = str(latest.get('reason', ''))
+        except Exception as e:
+            logger.warning(f'namechange {symbol} 失败: {e}')
+
+        self._wait()
+        try:
+            sb = self.pro.stock_basic(ts_code=ts_code, fields='ts_code,name,delist_date')
+            if sb is not None and not sb.empty:
+                dl_date = sb.iloc[0].get('delist_date')
+                if pd.notna(dl_date):
+                    result['is_delisted'] = True
+                    result['delist_date'] = str(dl_date)
+        except Exception as e:
+            logger.warning(f'stock_basic {symbol} 失败: {e}')
+
+        # 4. 保存到磁盘和内存缓存
+        self._save_pickle_cache(ck, pd.DataFrame([result]))
+        self._listing_status_cache[symbol] = result
+        return result
 
     # ========================================================================
     # 主筛选方法
@@ -506,13 +588,20 @@ class StockSelector:
             return pd.DataFrame()
 
         # ── Step 6: ST / 退市（提前做，减少后续请求） ──
+        # 使用自带频率控制的 _get_listing_status，内部每次调用 2 个 API 均有 _wait()
+        # 注意：448只股票 × 2API × 1.2s间隔 ≈ 18分钟，有进度提示不会卡死
         symbols = candidates['symbol'].tolist()
         st_flags = {}
         delisted_flags = {}
-        for sym in symbols:
-            status = self.fm.get_listing_status(sym)
+        total_sym = len(symbols)
+        for idx, sym in enumerate(symbols):
+            if verbose and (idx % 10 == 0):
+                print(f'  检查ST/退市: {idx+1}/{total_sym} ({((idx+1)/total_sym)*100:.0f}%)')
+            status = self._get_listing_status(sym)
             st_flags[sym] = status.get('is_st', False)
             delisted_flags[sym] = status.get('is_delisted', False)
+        if verbose:
+            print(f'  检查ST/退市: {total_sym}/{total_sym} (100%) 完成')
         candidates['is_st'] = candidates['symbol'].map(st_flags)
         candidates['is_delisted'] = candidates['symbol'].map(delisted_flags)
         before = len(candidates)
@@ -523,10 +612,30 @@ class StockSelector:
         if candidates.empty:
             return pd.DataFrame()
 
+        # ── 统一加载 daily_basic（一次性拉取全部 PE/市值字段到内存）──
+        db_data = {}
+        for i, sym in enumerate(candidates['symbol']):
+            if verbose and (i % 20 == 0):
+                print(f'  加载 daily_basic: {i+1}/{len(candidates)}')
+            db_data[sym] = self._get_daily_basic(sym)
+
         # ── Step 10: 市值 20-300 亿 ──
         mkt_caps = {}
         for sym in candidates['symbol']:
-            mkt_caps[sym] = self.get_market_cap(sym, trade_date)
+            df = db_data.get(sym)
+            if df is None or df.empty:
+                mkt_caps[sym] = None
+                continue
+            target_dt = pd.to_datetime(trade_date)
+            df_hist = df[df['trade_date'] <= target_dt].sort_values('trade_date')
+            if df_hist.empty:
+                mkt_caps[sym] = None
+                continue
+            mv = df_hist.iloc[-1].get('total_mv')
+            if mv is not None and pd.notna(mv) and float(mv) > 0:
+                mkt_caps[sym] = round(float(mv) / 10000, 2)
+            else:
+                mkt_caps[sym] = None
         candidates['market_cap'] = candidates['symbol'].map(mkt_caps)
         before = len(candidates)
         candidates = candidates[
@@ -623,15 +732,33 @@ class StockSelector:
             return pd.DataFrame()
 
         # ── 获取毛利率、研发占比等基本面指标 ──
+        # 注意：不使用 get_all_metrics，因为其内部的 calculate_peg 会直接调 daily_basic API，
+        # 绕过 _get_daily_basic 缓存。这里直接从已缓存的 fina_indicator/income 中提取。
         gross_margins = {}
         rd_ratios = {}
         gm_slopes = {}
         for i, sym in enumerate(candidates['symbol']):
             if verbose and (i % 10 == 0):
                 print(f'  获取基本面数据: {i+1}/{len(candidates)}')
-            metrics = self.fm.get_all_metrics(sym, trade_date)
-            gross_margins[sym] = metrics.get('gross_margin')
-            rd_ratios[sym] = metrics.get('rd_ratio')
+            # 毛利率（从 fina_indicator 最新一期获取）
+            df_fina = self.fm.get_fina_indicator(sym)
+            if df_fina is not None and not df_fina.empty:
+                latest_f = df_fina.sort_values('end_date', ascending=False).iloc[0]
+                gross_margins[sym] = float(latest_f['grossprofit_margin']) if pd.notna(latest_f.get('grossprofit_margin')) else None
+            else:
+                gross_margins[sym] = None
+            # 研发占比（rd_exp / total_revenue）
+            df_income = self.fm.get_income(sym)
+            if df_income is not None and not df_income.empty:
+                latest_i = df_income.sort_values('end_date', ascending=False).iloc[0]
+                rev = latest_i.get('total_revenue')
+                rd = latest_i.get('rd_exp')
+                if rev and rd and rev > 0:
+                    rd_ratios[sym] = round(float(rd) / float(rev) * 100, 2)
+                else:
+                    rd_ratios[sym] = None
+            else:
+                rd_ratios[sym] = None
             # 毛利率 3 年趋势
             gm_slopes[sym] = self.calc_gross_margin_slope(sym, years=3)
 
@@ -687,14 +814,33 @@ class StockSelector:
         if candidates.empty:
             return pd.DataFrame()
 
-        # ── Step 11: PE < 历史 80% 分位 ──
+        # ── Step 11: PE < 历史 80% 分位（统一从 db_data 提取）──
         pe_80 = {}
         pe_current = {}
-        for i, sym in enumerate(candidates['symbol']):
-            if verbose and (i % 10 == 0):
-                print(f'  计算 PE 分位: {i+1}/{len(candidates)}')
-            pe_80[sym] = self.get_pe_80th_percentile(sym)
-            pe_current[sym] = self.get_current_pe_ttm(sym, trade_date)
+        for sym in candidates['symbol']:
+            df = db_data.get(sym)
+            if df is None or df.empty:
+                pe_80[sym] = None
+                pe_current[sym] = None
+                continue
+            # PE 历史 80% 分位
+            pe_series = df['pe_ttm'].dropna()
+            pe_series = pe_series[pe_series > 0]
+            if len(pe_series) >= 20:
+                pe_80[sym] = float(np.percentile(pe_series, 80))
+            else:
+                pe_80[sym] = None
+            # 当前 PE（trade_date 及之前最近交易日）
+            target_dt = pd.to_datetime(trade_date)
+            df_hist = df[df['trade_date'] <= target_dt].sort_values('trade_date')
+            if not df_hist.empty:
+                pe_val = df_hist.iloc[-1].get('pe_ttm')
+                if pe_val is not None and pd.notna(pe_val) and float(pe_val) > 0:
+                    pe_current[sym] = float(pe_val)
+                else:
+                    pe_current[sym] = None
+            else:
+                pe_current[sym] = None
         candidates['pe_80th'] = candidates['symbol'].map(pe_80)
         candidates['pe_ttm'] = candidates['symbol'].map(pe_current)
         before = len(candidates)
@@ -715,7 +861,7 @@ class StockSelector:
         for i, sym in enumerate(candidates['symbol']):
             if verbose and (i % 10 == 0):
                 print(f'  计算 PEG: {i+1}/{len(candidates)}')
-            peg, growth = self.fm.calculate_peg(sym, trade_date)
+            peg, growth = self._calculate_peg(sym, pe_current.get(sym))
             peg_dict[sym] = peg
             growth_dict[sym] = growth
         candidates['peg'] = candidates['symbol'].map(peg_dict)
@@ -748,6 +894,152 @@ class StockSelector:
 
         return result
 
+    def _all_caches_exist(self, symbols: List[str]) -> bool:
+        """检查所有核心缓存文件是否存在（任一缺失则返回 False）"""
+        cache_keys = ['listing_status', 'daily_basic', 'pledge', 'bs', 'fina', 'income']
+        for sym in symbols:
+            for prefix in cache_keys:
+                p = self._cache_path(f'{prefix}_{sym}')
+                # 注意：FundamentalsManager 的缓存路径不在 self.cache_dir 下
+                # 所以我们只检查 StockSelector 自己管理的缓存
+                if prefix in ('listing_status', 'daily_basic', 'pledge', 'bs'):
+                    if not p.exists():
+                        return False
+                # fm 的缓存文件名不同，单独检查
+                else:
+                    fm_path = self.fm.cache_dir / f'{prefix}_{sym}.parquet'
+                    if not fm_path.exists():
+                        return False
+        return True
+
+    def _warmup_memory_caches(self, symbols: List[str]):
+        """
+        预热内存缓存：将磁盘上的持久化缓存一次性读入内存字典，
+        后续 select() 中所有方法直接命中内存，零磁盘 I/O。
+        """
+        print(f'  🔥 预热内存缓存 ({len(symbols)} 只)...')
+        for idx, sym in enumerate(symbols):
+            if idx % 50 == 0:
+                print(f'    {idx+1}/{len(symbols)} ({(idx+1)/len(symbols)*100:.0f}%)')
+            # 触发方法内部的内存缓存填充（从磁盘读取一次）
+            _ = self._get_listing_status(sym)   # 内存+磁盘 → 入 mem
+            _ = self._get_daily_basic(sym)      # 内存+磁盘 → 入 mem
+            _ = self.get_pledge_ratio(sym)      # 内存+磁盘 → 入 mem
+            _ = self._get_balance_sheet(sym)    # 内存+磁盘 → 入 mem
+            _ = self.fm.get_fina_indicator(sym) # fm 内存+磁盘 → 入 fm mem
+            _ = self.fm.get_income(sym)         # fm 内存+磁盘 → 入 fm mem
+        print(f'    {len(symbols)}/{len(symbols)} (100%) 完成')
+
+    # ========================================================================
+    # 批量预加载
+    # ========================================================================
+    def preload_all_data(self, sectors: Optional[List[str]] = None, force: bool = False) -> int:
+        """
+        一次性预加载目标行业所有股票的全部数据到磁盘缓存。
+        后续 select() 将直接读取缓存，几乎不调 API。
+
+        Parameters
+        ----------
+        sectors : List[str] or None
+            行业列表，None 则使用 self.industries
+        force : bool
+            强制重新拉取（即使缓存已存在）
+
+        Returns
+        -------
+        int : 预加载的股票数量
+        """
+        target_industries = sectors or self.industries
+        all_stocks = self.sim.get_all_stocks_info(force_update=False)
+        candidates = all_stocks.reset_index()
+        candidates = candidates[
+            candidates['industry'].isin(target_industries)
+        ]
+        symbols = (
+            candidates['symbol']
+            .astype(str)
+            .str.zfill(6)
+            .tolist()
+        )
+        total = len(symbols)
+
+        # 快速检查：如果所有缓存都存在且 force=False，只预热内存，不调 API
+        if not force and self._all_caches_exist(symbols):
+            print(f'\n✅ 所有缓存已存在（{total} 只），跳过 API 预加载。')
+            self._warmup_memory_caches(symbols)
+            print(f'   如需强制更新请设置 preload_all_data(force=True) 或删除缓存目录。\n')
+            return total
+
+        print(f'\n🚀 预加载 {total} 只股票数据到本地缓存...')
+
+        # 1. ST/退市
+        print('  [1/7] 预加载 ST/退市状态...')
+        for idx, sym in enumerate(symbols):
+            if idx % 20 == 0:
+                print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
+            _ = self._get_listing_status(sym)
+        print(f'    {total}/{total} (100%) 完成')
+
+        # 2. daily_basic（市值 / PE）
+        print('  [2/7] 预加载 daily_basic（市值/PE）...')
+        for idx, sym in enumerate(symbols):
+            if idx % 20 == 0:
+                print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
+            _ = self._get_daily_basic(sym)
+        print(f'    {total}/{total} (100%) 完成')
+
+        # 3. 质押
+        print('  [3/7] 预加载 股东质押比例...')
+        for idx, sym in enumerate(symbols):
+            if idx % 20 == 0:
+                print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
+            _ = self.get_pledge_ratio(sym)
+        print(f'    {total}/{total} (100%) 完成')
+
+        # 4. 资产负债表（商誉）
+        print('  [4/7] 预加载 资产负债表（商誉）...')
+        for idx, sym in enumerate(symbols):
+            if idx % 20 == 0:
+                print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
+            _ = self._get_balance_sheet(sym)
+        print(f'    {total}/{total} (100%) 完成')
+
+        # 5. 财务指标（毛利率）
+        print('  [5/7] 预加载 财务指标（毛利率）...')
+        for idx, sym in enumerate(symbols):
+            if idx % 20 == 0:
+                print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
+            _ = self.fm.get_fina_indicator(sym)
+        print(f'    {total}/{total} (100%) 完成')
+
+        # 6. 利润表（营收/研发/净利润）
+        print('  [6/7] 预加载 利润表（营收/研发/净利润）...')
+        for idx, sym in enumerate(symbols):
+            if idx % 20 == 0:
+                print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
+            _ = self.fm.get_income(sym)
+        print(f'    {total}/{total} (100%) 完成')
+
+        # 7. 日线数据（成交额/振幅）
+        print('  [7/7] 预加载 日线数据（成交额/振幅）...')
+        for idx, sym in enumerate(symbols):
+            if idx % 20 == 0:
+                print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
+            try:
+                _ = self.dm.get_stock_data(
+                    symbol=sym,
+                    #start_date='20230101',
+                    start_date='20260103',
+                    end_date=datetime.now().strftime('%Y%m%d'),
+                    adjust='qfq',
+                )
+            except Exception:
+                pass
+        print(f'    {total}/{total} (100%) 完成')
+
+        print(f'\n✅ 预加载全部完成！共 {total} 只股票，后续选股将直接使用本地缓存。\n')
+        return total
+
     # ========================================================================
     # 月度回测
     # ========================================================================
@@ -757,6 +1049,7 @@ class StockSelector:
         end_date: str = '20260713',
         output_excel: Optional[str] = None,
         verbose: bool = True,
+        preload: bool = True,
     ) -> pd.DataFrame:
         """
         月度选股回测：每月1号选股，汇总结果。
@@ -772,6 +1065,8 @@ class StockSelector:
             stock_selection_YYYYMMDD_HHMMSS.xlsx
         verbose : bool
             是否打印详细信息
+        preload : bool
+            是否预加载数据
 
         Returns
         -------
@@ -779,6 +1074,10 @@ class StockSelector:
         """
         start_date = start_date.replace('-', '')
         end_date = end_date.replace('-', '')
+
+        # ── 预加载：一次性拉取全部数据到本地缓存 ──
+        if preload:
+            self.preload_all_data(sectors=self.industries)
 
         # 生成每月1号日期列表
         start_dt = pd.to_datetime(start_date)
@@ -874,32 +1173,37 @@ if __name__ == '__main__':
         exit(1)
 
     # ====== Step A: 发现行业（首次运行建议开启） ======
-    sel = StockSelector(token=token, request_interval=1.0)
+    # sel = StockSelector(token=token, request_interval=0.4)
 
-    print('\n🔍 发现医药相关行业...')
-    industry_df = sel.discover_industries(keyword='医药|制药|医疗|生物|疫苗|CRO|中药|原料药|血液|体外|基因')
-    print(f'\n共发现 {len(industry_df)} 个相关行业')
-    print('请确认上述行业后，将其作为 industries 参数传入 StockSelector')
-    print('当前默认行业:')
-    for ind in DEFAULT_MEDICAL_INDUSTRIES:
-        print(f'  - {ind}')
+    # print('\n🔍 发现医药相关行业...')
+    # industry_df = sel.discover_industries(keyword='医药|制药|医疗|生物|疫苗|CRO|中药|原料药|血液|体外|基因')
+    # print(f'\n共发现 {len(industry_df)} 个相关行业')
+    # print('请确认上述行业后，将其作为 industries 参数传入 StockSelector')
+    # print('当前默认行业:')
+    # for ind in DEFAULT_MEDICAL_INDUSTRIES:
+    #     print(f'  - {ind}')
 
     # ====== Step B: 月度回测选股 ======
     print('\n' + '='*70)
-    print('🚀 开始月度选股回测: 2024-01-01 → 2026-07-13')
+    print('🚀 开始月度选股回测: 2026-01-03 → 2026-07-13')
     print('='*70)
 
     sel = StockSelector(
         token=token,
-        industries=DEFAULT_MEDICAL_INDUSTRIES,
-        request_interval=1.0,
+        # industries=DEFAULT_MEDICAL_INDUSTRIES,
+        industries=['医疗保健', '化学制药', '生物制药', '医药商业'],
+        request_interval=0.4,
     )
 
+    # 生成带日期时间的报告文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     df_results = sel.run_monthly(
-        start_date='20240101',
+        start_date='20260103',
         end_date='20260713',
-        output_excel='stock_selection_results.xlsx',
+        output_excel=f'stock_selection_results_{timestamp}.xlsx',
         verbose=True,
+        #preload=False
     )
 
     if not df_results.empty:
