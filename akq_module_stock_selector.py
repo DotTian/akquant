@@ -130,7 +130,14 @@ class StockSelector:
 
     @staticmethod
     def _to_ts_code(symbol: str) -> str:
-        code = str(symbol).zfill(6)
+        if symbol is None:
+            return ''
+        code = str(symbol).strip().upper()
+        if '.' in code:
+            code = code.split('.', 1)[0]
+        code = code.zfill(6)
+        if code.startswith(('43', '83', '87', '88', '92')):
+            return f'{code}.BJ'
         if code.startswith(('688', '600', '601', '603', '605')):
             return f'{code}.SH'
         return f'{code}.SZ'
@@ -688,9 +695,8 @@ class StockSelector:
             loss_flags[sym] = self.is_last_fiscal_year_loss(sym, trade_date)
         candidates['is_loss_last_year'] = candidates['symbol'].map(loss_flags)
         before = len(candidates)
-        candidates = candidates[
-            ~candidates['is_loss_last_year'].fillna(True)
-        ].copy()
+        keep_non_loss = ~candidates['is_loss_last_year'].fillna(True).astype(bool)
+        candidates = candidates[keep_non_loss].copy()
         if verbose:
             print(f'[6] 排除上年度亏损 → {before} → {len(candidates)}')
 
@@ -1147,7 +1153,12 @@ class StockSelector:
                 f'stock_selection_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
             )
 
-        with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+        output_path = Path(output_excel)
+        if not output_path.is_absolute() and output_path.parent == Path('.'):
+            output_path = Path(__file__).resolve().parent / 'reports' / output_path.name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
             df_summary.to_excel(writer, sheet_name='月度汇总', index=False)
             if not df_all.empty:
                 df_all.to_excel(writer, sheet_name='详细结果', index=False)
@@ -1156,7 +1167,7 @@ class StockSelector:
                     sheet_name = str(month)[:7]  # 如 '2024-01'
                     group.to_excel(writer, sheet_name=sheet_name, index=False)
 
-        print(f'\n📁 结果已保存至: {output_excel}')
+        print(f'\n📁 结果已保存至: {output_path}')
         return df_all
 
 
@@ -1201,10 +1212,14 @@ if __name__ == '__main__':
     # 生成带日期时间的报告文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    report_dir = Path(__file__).resolve().parent / 'reports'
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f'stock_selection_results_{timestamp}.xlsx'
+
     df_results = sel.run_monthly(
-        start_date='20260103',
+        start_date='20260503',
         end_date='20260713',
-        output_excel=f'stock_selection_results_{timestamp}.xlsx',
+        output_excel=str(report_path),
         verbose=True,
         #preload=False
     )

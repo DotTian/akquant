@@ -247,12 +247,18 @@ class DailyReportGenerator:
 
     @staticmethod
     def _to_ts_code(symbol: str) -> str:
-        """将纯数字代码转为 tushare 格式"""
-        code = str(symbol).zfill(6)
+        """将股票代码转为 tushare 格式，兼容已带后缀的输入。"""
+        if symbol is None:
+            return ''
+        code = str(symbol).strip().upper()
+        if '.' in code:
+            code = code.split('.', 1)[0]
+        code = code.zfill(6)
+        if code.startswith(('43', '83', '87', '88', '92')):
+            return f"{code}.BJ"
         if code.startswith(('688', '600', '601', '603', '605')):
             return f"{code}.SH"
-        else:
-            return f"{code}.SZ"
+        return f"{code}.SZ"
 
     # ── 生成背离图片（base64） ──
     def _generate_divergence_chart(self, df: pd.DataFrame, symbol: str, stock_name: str) -> str:

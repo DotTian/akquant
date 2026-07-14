@@ -70,15 +70,23 @@ class TushareStockDataManager:
             time.sleep(wait_time)
         self.last_request_time = time.time()
     
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        """规范化股票代码，去掉已有市场后缀后再转成 6 位数字代码。"""
+        if symbol is None:
+            return ''
+        code = str(symbol).strip().upper()
+        if '.' in code:
+            code = code.split('.', 1)[0]
+        return code.zfill(6)
+
     def _convert_symbol(self, symbol: str) -> str:
         """
-        将纯数字代码转换为 Tushare 格式
-        示例：'688131' -> '688131.SH'
-              '000001' -> '000001.SZ'
-              '920017' -> '920017.BJ'
+        将股票代码转换为 Tushare 格式。
+        兼容输入：'688131'、'688131.SH'、'920017.BJ'。
         """
-        code = str(symbol).zfill(6)
-        
+        code = self._normalize_symbol(symbol)
+
         # 北交所（43/83/87/88/92 开头）
         if code.startswith(('43', '83', '87', '88', '92')):
             return f"{code}.BJ"
