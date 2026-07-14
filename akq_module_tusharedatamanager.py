@@ -75,14 +75,17 @@ class TushareStockDataManager:
         将纯数字代码转换为 Tushare 格式
         示例：'688131' -> '688131.SH'
               '000001' -> '000001.SZ'
+              '920017' -> '920017.BJ'
         """
         code = str(symbol).zfill(6)
         
+        # 北交所（43/83/87/88/92 开头）
+        if code.startswith(('43', '83', '87', '88', '92')):
+            return f"{code}.BJ"
         # 上海市场：688(科创板)、600/601/603/605(主板)
         if code.startswith(('688', '600', '601', '603', '605')):
             return f"{code}.SH"
         # 深圳市场：000/001/002(主板)、003(中小板)、300/301(创业板)
-        else:
             return f"{code}.SZ"
     
     # def _convert_to_akquant_format(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -146,9 +149,9 @@ class TushareStockDataManager:
         existing_mapping = {k: v for k, v in column_mapping.items() if k in df.columns}
         df = df.rename(columns=existing_mapping)
         
-        # 2. 处理 symbol 列（去掉 .SH/.SZ 后缀）
+        # 2. 处理 symbol 列（去掉 .SH/.SZ/.BJ 后缀）
         if 'symbol' in df.columns:
-            df['symbol'] = df['symbol'].str.replace(r'\.(SH|SZ)$', '', regex=True)
+            df['symbol'] = df['symbol'].str.replace(r'\.(SH|SZ|BJ)$', '', regex=True)
         elif symbol:
             df['symbol'] = symbol
         

@@ -933,7 +933,7 @@ class StockSelector:
     # ========================================================================
     # 批量预加载
     # ========================================================================
-    def preload_all_data(self, sectors: Optional[List[str]] = None, force: bool = False) -> int:
+    def preload_all_data(self, sectors: Optional[List[str]] = None, force: bool = False, start_date: str = '20180101', end_date: Optional[str] = None) -> int:
         """
         一次性预加载目标行业所有股票的全部数据到磁盘缓存。
         后续 select() 将直接读取缓存，几乎不调 API。
@@ -944,6 +944,10 @@ class StockSelector:
             行业列表，None 则使用 self.industries
         force : bool
             强制重新拉取（即使缓存已存在）
+        start_date : str
+            日线数据起始日期 (YYYYMMDD)，默认 '20180101'
+        end_date : str or None
+            日线数据结束日期 (YYYYMMDD)，None 则为当天
 
         Returns
         -------
@@ -1028,9 +1032,8 @@ class StockSelector:
             try:
                 _ = self.dm.get_stock_data(
                     symbol=sym,
-                    #start_date='20230101',
-                    start_date='20260103',
-                    end_date=datetime.now().strftime('%Y%m%d'),
+                    start_date=start_date,
+                    end_date=end_date or datetime.now().strftime('%Y%m%d'),
                     adjust='qfq',
                 )
             except Exception:
@@ -1077,7 +1080,7 @@ class StockSelector:
 
         # ── 预加载：一次性拉取全部数据到本地缓存 ──
         if preload:
-            self.preload_all_data(sectors=self.industries)
+            self.preload_all_data(sectors=self.industries, start_date=start_date, end_date=end_date)
 
         # 生成每月1号日期列表
         start_dt = pd.to_datetime(start_date)
