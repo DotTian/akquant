@@ -1217,7 +1217,7 @@ if __name__ == '__main__':
     report_path = report_dir / f'stock_selection_results_{timestamp}.xlsx'
 
     df_results = sel.run_monthly(
-        start_date='20260503',
+        start_date='20260501',
         end_date='20260713',
         output_excel=str(report_path),
         verbose=True,

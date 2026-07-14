@@ -69,6 +69,53 @@ class TushareStockDataManager:
             wait_time = self.request_interval - elapsed
             time.sleep(wait_time)
         self.last_request_time = time.time()
+
+    def _infer_exchange(self, symbol: str) -> Optional[str]:
+        """根据股票代码推断交易所代码。"""
+        code = self._normalize_symbol(symbol)
+        if code.startswith(('43', '83', '87', '88', '92')):
+            return 'BSE'
+        if code.startswith(('688', '600', '601', '603', '605')):
+            return 'SSE'
+        return 'SZSE'
+
+    def _align_trade_window(self, symbol: str, start_date: str, end_date: str) -> tuple[str, str]:
+        """将请求窗口对齐到交易日；若区间内没有交易日，则返回空区间。"""
+        start_date = start_date.replace('-', '')
+        end_date = end_date.replace('-', '')
+        if not hasattr(self, 'pro') or self.pro is None:
+            return start_date, end_date
+
+        exchange = self._infer_exchange(symbol)
+        try:
+            self._wait_if_needed()
+            cal_df = self.pro.trade_cal(
+                exchange=exchange,
+                start_date=start_date,
+                end_date=end_date,
+                is_open='1',
+            )
+        except Exception as e:
+            logger.debug(f'获取交易日历失败 {symbol}: {e}')
+            return start_date, end_date
+
+        if cal_df is None or cal_df.empty:
+            return start_date, end_date
+
+        trade_dates = pd.to_datetime(cal_df['cal_date']).dt.strftime('%Y%m%d').tolist()
+        if not trade_dates:
+            return start_date, end_date
+
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        trade_dt = pd.to_datetime(trade_dates)
+        valid = trade_dt[(trade_dt >= start_dt) & (trade_dt <= end_dt)]
+        if valid.empty:
+            return '', ''
+
+        aligned_start = valid.min().strftime('%Y%m%d')
+        aligned_end = valid.max().strftime('%Y%m%d')
+        return aligned_start, aligned_end
     
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:
@@ -297,6 +344,15 @@ class TushareStockDataManager:
         # 标准化日期
         start_date_clean = start_date.replace('-', '')
         end_date_clean = end_date.replace('-', '')
+        target_start = pd.to_datetime(start_date_clean)
+        target_end = pd.to_datetime(end_date_clean)
+
+        aligned_start, aligned_end = self._align_trade_window(symbol, start_date_clean, end_date_clean)
+        if aligned_start == '' and aligned_end == '':
+            logger.info(f'{symbol} 请求区间中无交易日，跳过获取')
+            return pd.DataFrame()
+        start_date_clean = aligned_start or start_date_clean
+        end_date_clean = aligned_end or end_date_clean
         target_start = pd.to_datetime(start_date_clean)
         target_end = pd.to_datetime(end_date_clean)
 
