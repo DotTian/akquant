@@ -86,7 +86,7 @@ class TushareStockDataManager:
         if code.startswith(('688', '600', '601', '603', '605')):
             return f"{code}.SH"
         # 深圳市场：000/001/002(主板)、003(中小板)、300/301(创业板)
-            return f"{code}.SZ"
+        return f"{code}.SZ"
     
     # def _convert_to_akquant_format(self, df: pd.DataFrame) -> pd.DataFrame:
     #     """
