@@ -316,8 +316,9 @@ class TushareStockDataManager:
                     logger.error(f"获取 {symbol} 数据最终失败")
                     raise
     
-    def get_stock_data(self, symbol: str, start_date: str, end_date: str, 
-                        force_update: bool = False, adjust: str = 'qfq') -> pd.DataFrame:
+    def get_stock_data(self, symbol: str, start_date: str, end_date: str,
+                        force_update: bool = False, adjust: str = 'qfq',
+                        allow_api: bool = True) -> pd.DataFrame:
         """
         动态获取股票数据（核心方法）
         - 优先读取本地 Parquet 缓存
@@ -336,6 +337,8 @@ class TushareStockDataManager:
             是否强制更新全部数据
         adjust : str
             复权类型：'qfq'(前复权), 'hfq'(后复权), None(不复权)
+        allow_api : bool
+            是否允许访问 Tushare。False 时仅使用本地缓存，不做任何补拉。
     
         Returns:
         --------
@@ -346,6 +349,82 @@ class TushareStockDataManager:
         end_date_clean = end_date.replace('-', '')
         target_start = pd.to_datetime(start_date_clean)
         target_end = pd.to_datetime(end_date_clean)
+        file_path = self.data_dir / f"{symbol}.parquet"
+
+        # 缓存命中快速路径：区间已被本地数据覆盖时，直接裁剪返回，避免 trade_cal/API。
+        if (not force_update) and file_path.exists():
+            df_existing = pd.read_parquet(file_path)
+            if not isinstance(df_existing.index, pd.DatetimeIndex):
+                df_existing.index = pd.to_datetime(df_existing.index)
+            first_existing = df_existing.index.min()
+            last_existing = df_existing.index.max()
+
+            if first_existing <= target_start and last_existing >= target_end:
+                logger.debug(
+                    f"缓存命中 {symbol}: {target_start.strftime('%Y-%m-%d')} - "
+                    f"{target_end.strftime('%Y-%m-%d')}"
+                )
+                return self._trim_by_date(df_existing, start_date_clean, end_date_clean)
+
+            logger.debug(f"读取已有 {symbol} 数据: {len(df_existing)} 条, "
+                         f"日期范围: {first_existing.strftime('%Y-%m-%d')} - {last_existing.strftime('%Y-%m-%d')}")
+
+            # 本地模式：区间不全时也不补拉，直接返回现有区间的裁剪结果。
+            if not allow_api:
+                return self._trim_by_date(df_existing, start_date_clean, end_date_clean)
+
+            aligned_start, aligned_end = self._align_trade_window(symbol, start_date_clean, end_date_clean)
+            if aligned_start == '' and aligned_end == '':
+                logger.info(f'{symbol} 请求区间中无交易日，跳过获取')
+                return pd.DataFrame()
+            start_date_clean = aligned_start or start_date_clean
+            end_date_clean = aligned_end or end_date_clean
+            target_start = pd.to_datetime(start_date_clean)
+            target_end = pd.to_datetime(end_date_clean)
+
+            need_save = False
+
+            # 4. 检查是否需要补充早期数据（start_date 早于现有数据的最早日期）
+            if first_existing > target_start:
+                missing_start = target_start.strftime("%Y%m%d")
+                missing_end = (first_existing - pd.Timedelta(days=1)).strftime("%Y%m%d")
+                logger.debug(f"需要补充早期数据: {missing_start} 至 {missing_end}")
+                try:
+                    df_early = self._fetch_from_tushare(symbol, missing_start, missing_end, adjust=adjust)
+                    if not df_early.empty:
+                        df_existing = pd.concat([df_early, df_existing])
+                        df_existing = df_existing[~df_existing.index.duplicated(keep='last')]
+                        df_existing = df_existing.sort_index()
+                        need_save = True
+                        logger.debug(f"早期数据补充完成: 新增 {len(df_early)} 条")
+                except Exception as e:
+                    logger.warning(f"补充早期数据失败: {e}，继续使用现有数据")
+
+            # 5. 检查是否需要补充最新数据（end_date 晚于现有数据的最晚日期）
+            if last_existing < target_end:
+                missing_start = (last_existing + pd.Timedelta(days=1)).strftime("%Y%m%d")
+                missing_end = target_end.strftime("%Y%m%d")
+                logger.debug(f"需要补充最新数据: {missing_start} 至 {missing_end}")
+                try:
+                    df_late = self._fetch_from_tushare(symbol, missing_start, missing_end, adjust=adjust)
+                    if not df_late.empty:
+                        df_existing = pd.concat([df_existing, df_late])
+                        df_existing = df_existing[~df_existing.index.duplicated(keep='last')]
+                        df_existing = df_existing.sort_index()
+                        need_save = True
+                        logger.debug(f"最新数据补充完成: 新增 {len(df_late)} 条")
+                except Exception as e:
+                    logger.warning(f"补充最新数据失败: {e}，返回现有数据范围")
+
+            # 6. 如有补充，保存更新后的数据
+            if need_save:
+                self._save_data(df_existing, file_path, symbol)
+
+            # 7. 按请求日期裁剪最终返回
+            return self._trim_by_date(df_existing, start_date_clean, end_date_clean)
+
+        if not allow_api:
+            return pd.DataFrame()
 
         aligned_start, aligned_end = self._align_trade_window(symbol, start_date_clean, end_date_clean)
         if aligned_start == '' and aligned_end == '':
@@ -356,8 +435,6 @@ class TushareStockDataManager:
         target_start = pd.to_datetime(start_date_clean)
         target_end = pd.to_datetime(end_date_clean)
 
-        file_path = self.data_dir / f"{symbol}.parquet"
-
         # 1. 强制更新：重新获取全部数据
         if force_update:
             logger.info(f"强制更新 {symbol} 全部数据...")
@@ -366,59 +443,10 @@ class TushareStockDataManager:
             return df_new
 
         # 2. 文件不存在：首次获取全部数据
-        if not file_path.exists():
-            logger.info(f"首次获取 {symbol} 数据...")
-            df_new = self._fetch_from_tushare(symbol, start_date_clean, end_date_clean, adjust=adjust)
-            self._save_data(df_new, file_path, symbol)
-            return df_new
-
-        # 3. 文件存在：读取已有数据
-        df_existing = pd.read_parquet(file_path)
-        first_existing = df_existing.index.min()
-        last_existing = df_existing.index.max()
-        logger.info(f"读取已有 {symbol} 数据: {len(df_existing)} 条, "
-                    f"日期范围: {first_existing.strftime('%Y-%m-%d')} - {last_existing.strftime('%Y-%m-%d')}")
-
-        need_save = False
-
-        # 4. 检查是否需要补充早期数据（start_date 早于现有数据的最早日期）
-        if first_existing > target_start:
-            missing_start = target_start.strftime("%Y%m%d")
-            missing_end = (first_existing - pd.Timedelta(days=1)).strftime("%Y%m%d")
-            logger.info(f"需要补充早期数据: {missing_start} 至 {missing_end}")
-            try:
-                df_early = self._fetch_from_tushare(symbol, missing_start, missing_end, adjust=adjust)
-                if not df_early.empty:
-                    df_existing = pd.concat([df_early, df_existing])
-                    df_existing = df_existing[~df_existing.index.duplicated(keep='last')]
-                    df_existing = df_existing.sort_index()
-                    need_save = True
-                    logger.info(f"早期数据补充完成: 新增 {len(df_early)} 条")
-            except Exception as e:
-                logger.warning(f"补充早期数据失败: {e}，继续使用现有数据")
-
-        # 5. 检查是否需要补充最新数据（end_date 晚于现有数据的最晚日期）
-        if last_existing < target_end:
-            missing_start = (last_existing + pd.Timedelta(days=1)).strftime("%Y%m%d")
-            missing_end = target_end.strftime("%Y%m%d")
-            logger.info(f"需要补充最新数据: {missing_start} 至 {missing_end}")
-            try:
-                df_late = self._fetch_from_tushare(symbol, missing_start, missing_end, adjust=adjust)
-                if not df_late.empty:
-                    df_existing = pd.concat([df_existing, df_late])
-                    df_existing = df_existing[~df_existing.index.duplicated(keep='last')]
-                    df_existing = df_existing.sort_index()
-                    need_save = True
-                    logger.info(f"最新数据补充完成: 新增 {len(df_late)} 条")
-            except Exception as e:
-                logger.warning(f"补充最新数据失败: {e}，返回现有数据范围")
-
-        # 6. 如有补充，保存更新后的数据
-        if need_save:
-            self._save_data(df_existing, file_path, symbol)
-
-        # 7. 按请求日期裁剪最终返回
-        return self._trim_by_date(df_existing, start_date_clean, end_date_clean)
+        logger.info(f"首次获取 {symbol} 数据...")
+        df_new = self._fetch_from_tushare(symbol, start_date_clean, end_date_clean, adjust=adjust)
+        self._save_data(df_new, file_path, symbol)
+        return df_new
     
     def _save_data(self, df: pd.DataFrame, file_path: Path, symbol: str):
         """保存数据到 Parquet 并更新元数据"""

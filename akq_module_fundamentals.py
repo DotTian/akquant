@@ -48,6 +48,8 @@ class FundamentalsManager:
         self._basic_info_cache: Dict[str, dict] = {}
         self._pledge_cache: Dict[str, Optional[float]] = {}
         self._bs_cache: Dict[str, pd.DataFrame] = {}
+        self._income_cache: Dict[str, pd.DataFrame] = {}
+        self._fina_cache: Dict[str, pd.DataFrame] = {}
 
     # ─── 工具方法 ───
     @staticmethod
@@ -78,10 +80,15 @@ class FundamentalsManager:
 
     # ─── 获取利润表数据 (含净利润/营收/研发费用) ───
     def get_income(self, symbol: str) -> Optional[pd.DataFrame]:
+        symbol_key = str(symbol).zfill(6)
+        if symbol_key in self._income_cache:
+            return self._income_cache[symbol_key]
+
         ts_code = self.to_ts_code(symbol)
         cache_key = f"income_{symbol}"
         df = self._load_cache(cache_key)
         if df is not None:
+            self._income_cache[symbol_key] = df
             return df
         time.sleep(self.request_interval)
         try:
@@ -95,6 +102,7 @@ class FundamentalsManager:
             if df is not None and not df.empty:
                 df['end_date'] = pd.to_datetime(df['end_date'])
                 self._save_cache(cache_key, df)
+                self._income_cache[symbol_key] = df
                 return df
         except Exception as e:
             logger.warning(f"获取 {symbol} income 失败: {e}")
@@ -102,10 +110,15 @@ class FundamentalsManager:
 
     # ─── 获取财务指标数据 (含毛利率/净利率/净利润增长率) ───
     def get_fina_indicator(self, symbol: str) -> Optional[pd.DataFrame]:
+        symbol_key = str(symbol).zfill(6)
+        if symbol_key in self._fina_cache:
+            return self._fina_cache[symbol_key]
+
         ts_code = self.to_ts_code(symbol)
         cache_key = f"fina_{symbol}"
         df = self._load_cache(cache_key)
         if df is not None:
+            self._fina_cache[symbol_key] = df
             return df
         time.sleep(self.request_interval)
         try:
@@ -118,6 +131,7 @@ class FundamentalsManager:
             if df is not None and not df.empty:
                 df['end_date'] = pd.to_datetime(df['end_date'])
                 self._save_cache(cache_key, df)
+                self._fina_cache[symbol_key] = df
                 return df
         except Exception as e:
             logger.warning(f"获取 {symbol} fina_indicator 失败: {e}")
