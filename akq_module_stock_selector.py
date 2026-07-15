@@ -1246,8 +1246,9 @@ if __name__ == '__main__':
     sel = StockSelector(
         token=token,
         # industries=DEFAULT_MEDICAL_INDUSTRIES,
-        industries=['医疗保健', '化学制药', '生物制药', '医药商业'],
-        request_interval=0.4,
+        #industries=['医疗保健', '化学制药', '生物制药', '医药商业'],
+        industries=['半导体', '元器件'],
+        request_interval=0.32,
     )
 
     # 生成带日期时间的报告文件名
@@ -1258,8 +1259,8 @@ if __name__ == '__main__':
     report_path = report_dir / f'stock_selection_results_{timestamp}.xlsx'
 
     df_results = sel.run_monthly(
-        start_date='20260101',
-        end_date='20260713',
+        start_date='20200101',
+        end_date='20260715',
         output_excel=str(report_path),
         verbose=True,
         #preload=False
