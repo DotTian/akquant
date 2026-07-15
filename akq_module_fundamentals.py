@@ -13,6 +13,7 @@ from typing import Optional, Dict, List
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import tushare as ts
 
 logger = logging.getLogger(__name__)
@@ -45,11 +46,15 @@ class FundamentalsManager:
 
         # 内存缓存（避免同一次运行重复请求）
         self._basic_info_cache: Dict[str, dict] = {}
+        self._pledge_cache: Dict[str, Optional[float]] = {}
+        self._bs_cache: Dict[str, pd.DataFrame] = {}
 
     # ─── 工具方法 ───
     @staticmethod
     def to_ts_code(symbol: str) -> str:
         code = str(symbol).zfill(6)
+        if code.startswith(('43', '83', '87', '88', '92')):
+            return f"{code}.BJ"
         if code.startswith(('688', '600', '601', '603', '605')):
             return f"{code}.SH"
         else:
@@ -223,6 +228,163 @@ class FundamentalsManager:
             return None
 
         return (ttm_ni - prev_ttm_ni) / abs(prev_ttm_ni) * 100
+
+    # ─── 质押 / 商誉 / 毛利率趋势 扩展接口 ───
+    def get_pledge_ratio(self, symbol: str) -> Optional[float]:
+        """获取全体股东质押比例 (%)。"""
+        if symbol in self._pledge_cache:
+            return self._pledge_cache[symbol]
+
+        cache_key = f"pledge_{symbol}"
+        df = self._load_cache(cache_key)
+        if df is not None:
+            val = None if df.empty else df.iloc[0].get('pledge_ratio')
+            ratio = float(val) if val is not None and pd.notna(val) else None
+            self._pledge_cache[symbol] = ratio
+            return ratio
+
+        ts_code = self.to_ts_code(symbol)
+        time.sleep(self.request_interval)
+        try:
+            df = self._pro.pledge_stat(ts_code=ts_code)
+            if df is not None and not df.empty:
+                self._save_cache(cache_key, df)
+                val = df.iloc[0].get('pledge_ratio')
+                ratio = float(val) if val is not None and pd.notna(val) else None
+            else:
+                self._save_cache(cache_key, pd.DataFrame({'cached': [True]}))
+                ratio = None
+            self._pledge_cache[symbol] = ratio
+            return ratio
+        except Exception as e:
+            logger.warning(f"获取 {symbol} pledge_stat 失败: {e}")
+            self._pledge_cache[symbol] = None
+            return None
+
+    def _get_balance_sheet(self, symbol: str) -> Optional[pd.DataFrame]:
+        """获取资产负债表（用于商誉比例计算）。"""
+        if symbol in self._bs_cache:
+            return self._bs_cache[symbol]
+
+        cache_key = f"bs_{symbol}"
+        df = self._load_cache(cache_key)
+        if df is not None:
+            self._bs_cache[symbol] = df
+            return df
+
+        ts_code = self.to_ts_code(symbol)
+        time.sleep(self.request_interval)
+        try:
+            df = self._pro.balancesheet(
+                ts_code=ts_code,
+                start_date='20180101',
+                end_date=datetime.now().strftime('%Y%m%d'),
+                fields='ts_code,end_date,goodwill,total_hldr_eqy_exc_min_int',
+                report_type='1',
+            )
+            if df is not None and not df.empty:
+                df['end_date'] = pd.to_datetime(df['end_date'])
+                self._save_cache(cache_key, df)
+                self._bs_cache[symbol] = df
+                return df
+        except Exception as e:
+            logger.warning(f"获取 {symbol} balancesheet 失败: {e}")
+        return None
+
+    def get_goodwill_ratio(self, symbol: str) -> Optional[float]:
+        """获取商誉 / 归母净资产比例 (%)。"""
+        df = self._get_balance_sheet(symbol)
+        if df is None or df.empty:
+            return None
+
+        latest = df.sort_values('end_date', ascending=False).iloc[0]
+        goodwill = latest.get('goodwill')
+        equity = latest.get('total_hldr_eqy_exc_min_int')
+        if (
+            goodwill is None
+            or equity is None
+            or pd.isna(goodwill)
+            or pd.isna(equity)
+            or float(equity) <= 0
+        ):
+            return None
+        return round(float(goodwill) / float(equity) * 100, 2)
+
+    def calc_gross_margin_slope(self, symbol: str, years: int = 3) -> Optional[float]:
+        """计算近 N 年毛利率线性回归斜率。"""
+        df_fina = self.get_fina_indicator(symbol)
+        if df_fina is None or df_fina.empty:
+            return None
+
+        if 'grossprofit_margin' not in df_fina.columns:
+            return None
+
+        df = (
+            df_fina[['end_date', 'grossprofit_margin']]
+            .dropna()
+            .sort_values('end_date')
+            .copy()
+        )
+        if len(df) < 3:
+            return None
+
+        cutoff = datetime.now() - timedelta(days=years * 365)
+        recent = df[df['end_date'] > pd.Timestamp(cutoff)].copy()
+        if len(recent) < 3:
+            return None
+
+        y = recent['grossprofit_margin'].astype(float).to_numpy()
+        x = np.arange(len(y), dtype=float)
+        valid = np.isfinite(y)
+        if valid.sum() < 3:
+            return None
+
+        slope, _ = np.polyfit(x[valid], y[valid], 1)
+        return round(float(slope), 4)
+
+    def get_latest_report_metrics(self, symbol: str, trade_date: str) -> Dict[str, Optional[float]]:
+        """聚合日报常用基本面指标。"""
+        result: Dict[str, Optional[float]] = {
+            'latest_net_profit': None,
+            'gross_margin': None,
+            'rd_ratio': None,
+            'peg': None,
+            'profit_growth': None,
+            'pledge_ratio': None,
+            'goodwill_ratio': None,
+            'gross_margin_slope_3y': None,
+            'report_end_date': None,
+        }
+
+        df_income = self.get_income(symbol)
+        if df_income is not None and not df_income.empty:
+            latest_i = df_income.sort_values('end_date', ascending=False).iloc[0]
+            net_profit = latest_i.get('n_income_attr_p')
+            if net_profit is not None and pd.notna(net_profit):
+                result['latest_net_profit'] = float(net_profit)
+            report_end = latest_i.get('end_date')
+            if report_end is not None and pd.notna(report_end):
+                result['report_end_date'] = str(pd.Timestamp(report_end).strftime('%Y-%m-%d'))
+            rev = latest_i.get('total_revenue')
+            rd = latest_i.get('rd_exp')
+            if rev is not None and rd is not None and pd.notna(rev) and pd.notna(rd) and float(rev) > 0:
+                result['rd_ratio'] = round(float(rd) / float(rev) * 100, 2)
+
+        df_fina = self.get_fina_indicator(symbol)
+        if df_fina is not None and not df_fina.empty:
+            latest_f = df_fina.sort_values('end_date', ascending=False).iloc[0]
+            gm = latest_f.get('grossprofit_margin')
+            if gm is not None and pd.notna(gm):
+                result['gross_margin'] = float(gm)
+
+        peg, growth = self.calculate_peg(symbol, trade_date)
+        result['peg'] = peg
+        result['profit_growth'] = growth
+        result['pledge_ratio'] = self.get_pledge_ratio(symbol)
+        result['goodwill_ratio'] = self.get_goodwill_ratio(symbol)
+        result['gross_margin_slope_3y'] = self.calc_gross_margin_slope(symbol, years=3)
+
+        return result
 
     # ─── 一站式获取所有基本面指标 ───
     def get_all_metrics(self, symbol: str, trade_date: str) -> Dict:
