@@ -198,7 +198,7 @@ def load_market_data(
 
 def main() -> None:
     """执行月度调仓回测。"""
-    excel_path = "reports/stock_selection_results_20260714_174057.xlsx"
+    excel_path = "reports/stock_selection_results_20260715_215442.xlsx"
     sheet_name = "详细结果"
     top_n = 5
     data_dir = "tsdata"
