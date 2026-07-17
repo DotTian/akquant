@@ -26,6 +26,7 @@ import platform
 import sys
 import logging
 import tempfile
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -41,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from akq_module_tusharedatamanager import TushareStockDataManager
 from akq_module_stockinfo import StockInfoManager
+from akq_module_fundamentals import FundamentalsManager
 from akq_module_divergence import DivergenceDetector, plot_divergence_chart
 from akq_module_trendclassifier import TrendClassifier, plot_trend_chart
 
@@ -78,8 +80,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             .top-volume {{ background-color: #e91e63; color: white; }}
             .bottom-macd {{ background-color: #4caf50; color: white; }}
             .bottom-volume {{ background-color: #2196f3; color: white; }}
-            .trend-bar {{ height: 24px; border-radius: 12px; overflow: hidden; margin: 10px 0; display: flex; }}
-            .trend-segment {{ display: flex; align-items: center; justify-content: center; font-size: 0.7rem; color: white; font-weight: bold; }}
             .footer {{ text-align: center; margin-top: 30px; padding: 20px; color: #6c757d; }}
         </style>
 </head>
@@ -141,6 +141,42 @@ STOCK_SECTION_TEMPLATE = """
             <div class="info-value">{data_count}</div>
         </div>
         <div class="info-item">
+            <div class="info-label">当前趋势</div>
+            <div class="info-value">{latest_trend}</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">背离类型数</div>
+            <div class="info-value">{divergence_type_count}</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">最近报告净利润(亿)</div>
+            <div class="info-value">{latest_net_profit}</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">全体股东质押比例</div>
+            <div class="info-value">{pledge_ratio}</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">商誉比例</div>
+            <div class="info-value">{goodwill_ratio}</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">毛利率</div>
+            <div class="info-value">{gross_margin}</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">3年毛利率趋势</div>
+            <div class="info-value">{gross_margin_slope_3y}</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">研发占营收比例</div>
+            <div class="info-value">{rd_ratio}</div>
+        </div>
+        <div class="info-item">
+            <div class="info-label">PEG</div>
+            <div class="info-value">{peg}</div>
+        </div>
+        <div class="info-item">
             <div class="info-label">最近收盘</div>
             <div class="info-value">{last_close:.2f}</div>
         </div>
@@ -151,13 +187,6 @@ STOCK_SECTION_TEMPLATE = """
         <strong>背离信号:</strong>
         {divergence_badges}
         <span class="text-muted ms-2">(共 {divergence_count} 个)</span>
-    </div>
-
-    <!-- 趋势分布条 -->
-    <div class="trend-bar">
-        <div class="trend-segment" style="width: {uptrend_pct}%; background-color: #4caf50;">↑ {uptrend_pct:.1f}%</div>
-        <div class="trend-segment" style="width: {range_pct}%; background-color: #ffc107; color: #333;">→ {range_pct:.1f}%</div>
-        <div class="trend-segment" style="width: {downtrend_pct}%; background-color: #f44336;">↓ {downtrend_pct:.1f}%</div>
     </div>
 
     <!-- 背离图 -->
@@ -216,11 +245,51 @@ class DailyReportGenerator:
             data_dir=stock_info_dir,
             request_interval=request_interval * 0.8
         )
+        self.fundamentals = FundamentalsManager(
+            token=token,
+            cache_dir='fundamentals_cache',
+            request_interval=request_interval,
+        )
         self.divergence_detector = DivergenceDetector(
             extremum_order=5,
             volume_confirm_ratio=0.95
         )
         self.trend_classifier = TrendClassifier()
+
+    @staticmethod
+    def _format_percent(value: Optional[float], digits: int = 2) -> str:
+        if value is None or pd.isna(value):
+            return 'N/A'
+        return f"{float(value):.{digits}f}%"
+
+    @staticmethod
+    def _format_float(value: Optional[float], digits: int = 2) -> str:
+        if value is None or pd.isna(value):
+            return 'N/A'
+        return f"{float(value):.{digits}f}"
+
+    @staticmethod
+    def _format_profit_yi(value: Optional[float], report_end_date: Optional[float]) -> str:
+        if value is None or pd.isna(value):
+            return 'N/A'
+        yi = float(value) / 100000000.0
+        if report_end_date:
+            return f"{yi:.2f} ({report_end_date})"
+        return f"{yi:.2f}"
+
+    @staticmethod
+    def _format_gross_margin_trend(slope: Optional[float], neutral_threshold: float = 0.05) -> str:
+        """将毛利率趋势斜率转换为可读文案。"""
+        if slope is None or pd.isna(slope):
+            return 'N/A'
+        value = float(slope)
+        if value > neutral_threshold:
+            trend = '上升'
+        elif value < -neutral_threshold:
+            trend = '下降'
+        else:
+            trend = '走平'
+        return f"{trend} ({value:+.4f})"
 
     # ── 获取财务数据（市盈率、市值等） ──
     def _get_financial_data(self, symbol: str, trade_date: str) -> Dict:
@@ -377,7 +446,8 @@ class DailyReportGenerator:
         )
 
         # 5. 生成背离信号标签
-        divergence_badges = []
+        divergence_counter: "OrderedDict[str, int]" = OrderedDict()
+        divergence_meta: dict[str, tuple[str, str]] = {}
         for d in divergences:
             badge_class = f"{d['type']}-{d['subtype']}"
             label = {
@@ -386,26 +456,39 @@ class DailyReportGenerator:
                 'bottom-macd': 'MACD底背离',
                 'bottom-volume': '量价底背离'
             }.get(badge_class, badge_class)
+            divergence_counter[badge_class] = divergence_counter.get(badge_class, 0) + 1
+            divergence_meta[badge_class] = (badge_class, label)
+
+        divergence_badges = []
+        for key, count in divergence_counter.items():
+            badge_class, label = divergence_meta[key]
+            label_text = f"{label} x{count}" if count > 1 else label
             divergence_badges.append(
-                f'<span class="divergence-item {badge_class}">{label}</span>'
+                f'<span class="divergence-item {badge_class}">{label_text}</span>'
             )
         divergence_html = ' '.join(divergence_badges) if divergence_badges else '<span class="text-muted">无背离信号</span>'
 
-        # 6. 计算趋势分布
-        trend_results = []
-        for i in range(60, len(df)):
-            close = df['close'].iloc[:i+1]
-            high = df['high'].iloc[:i+1]
-            low = df['low'].iloc[:i+1]
-            trend, _ = self.trend_classifier.classify(close, high, low)
-            trend_results.append(trend)
-        total_trend = len(trend_results)
-        if total_trend > 0:
-            uptrend_pct = trend_results.count('uptrend') / total_trend * 100
-            range_pct = trend_results.count('range') / total_trend * 100
-            downtrend_pct = trend_results.count('downtrend') / total_trend * 100
-        else:
-            uptrend_pct = range_pct = downtrend_pct = 0
+        # 6. 当前趋势 + 基本面增强字段
+        latest_trend_raw, _ = self.trend_classifier.classify(df['close'], df['high'], df['low'])
+        latest_trend = {
+            'uptrend': '上升',
+            'range': '震荡',
+            'downtrend': '下降',
+        }.get(latest_trend_raw, '未知')
+
+        fm_metrics = self.fundamentals.get_latest_report_metrics(symbol, last_trade_date)
+        latest_net_profit = self._format_profit_yi(
+            fm_metrics.get('latest_net_profit'),
+            fm_metrics.get('report_end_date'),
+        )
+        pledge_ratio = self._format_percent(fm_metrics.get('pledge_ratio'))
+        goodwill_ratio = self._format_percent(fm_metrics.get('goodwill_ratio'))
+        gross_margin = self._format_percent(fm_metrics.get('gross_margin'))
+        gross_margin_slope_3y = self._format_gross_margin_trend(
+            fm_metrics.get('gross_margin_slope_3y')
+        )
+        rd_ratio = self._format_percent(fm_metrics.get('rd_ratio'))
+        peg = self._format_float(fm_metrics.get('peg'))
 
         # 7. 生成图表 base64
         logger.info(f"生成 {symbol} 背离图...")
@@ -426,12 +509,18 @@ class DailyReportGenerator:
             circ_mv=fin['circ_mv'],
             turnover_rate=fin['turnover_rate'],
             data_count=len(df),
+            latest_trend=latest_trend,
+            divergence_type_count=len(divergence_counter),
+            latest_net_profit=latest_net_profit,
+            pledge_ratio=pledge_ratio,
+            goodwill_ratio=goodwill_ratio,
+            gross_margin=gross_margin,
+            gross_margin_slope_3y=gross_margin_slope_3y,
+            rd_ratio=rd_ratio,
+            peg=peg,
             last_close=last_close,
             divergence_badges=divergence_html,
             divergence_count=len(divergences),
-            uptrend_pct=uptrend_pct,
-            range_pct=range_pct,
-            downtrend_pct=downtrend_pct,
             divergence_chart=div_chart_b64,
             trend_chart=trend_chart_b64
         )
@@ -512,7 +601,7 @@ if __name__ == "__main__":
         exit(1)
 
     # 示例 symbols
-    symbols = ["002901", "002755", "000933", "000807", "688629", "688690", "301393", "301095", "002738", "301358", "688131",]
+    symbols = ["000807", "688131", "002901", "002755", "000933", "688629", "301393", "301095", "002738", "301358"]
     start_date = "20260101"
 
     generator = DailyReportGenerator(

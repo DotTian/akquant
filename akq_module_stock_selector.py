@@ -31,7 +31,7 @@ import time
 import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -114,6 +114,9 @@ class StockSelector:
         self._pledge_cache: Dict[str, Optional[float]] = {}
         self._bs_cache: Dict[str, pd.DataFrame] = {}
         self._listing_status_cache: Dict[str, dict] = {}
+        self._kline_cache: Dict[str, pd.DataFrame] = {}
+        self._kline_no_data_symbols: Set[str] = set()
+        self._daily_data_local_only: bool = False
 
         logger.info(
             f'StockSelector 初始化完成，目标行业: {len(self.industries)} 个'
@@ -433,19 +436,48 @@ class StockSelector:
             pd.to_datetime(trade_date) - timedelta(days=n_days * 3)
         ).strftime('%Y%m%d')
 
-        try:
-            df = self.dm.get_stock_data(
-                symbol=symbol, start_date=start, end_date=end, adjust='qfq'
-            )
-        except Exception as e:
-            logger.debug(f'{symbol} 日线获取失败: {e}')
+        df = self._kline_cache.get(symbol)
+        start_dt = pd.to_datetime(start)
+        end_dt = pd.to_datetime(end)
+
+        # 对已确认“无日线数据”的股票直接跳过，避免每月重复触发 API。
+        if symbol in self._kline_no_data_symbols and (df is None or df.empty):
             return None, None
+
+        # 若内存缓存未覆盖目标区间，则一次性拉到当前日期，后续月份复用同一份日线。
+        if df is None or df.empty or df.index.min() > start_dt or df.index.max() < end_dt:
+            cache_end = datetime.now().strftime('%Y%m%d')
+            try:
+                df = self.dm.get_stock_data(
+                    symbol=symbol,
+                    start_date=start,
+                    end_date=cache_end,
+                    adjust='qfq',
+                    allow_api=not self._daily_data_local_only,
+                )
+                if df is None or df.empty:
+                    # 本地模式下不将空窗口视为永久无数据，避免后续月份被误伤。
+                    if not self._daily_data_local_only:
+                        self._kline_no_data_symbols.add(symbol)
+                    return None, None
+                self._kline_cache[symbol] = df
+                self._kline_no_data_symbols.discard(symbol)
+            except Exception as e:
+                logger.debug(f'{symbol} 日线获取失败: {e}')
+                return None, None
 
         if df is None or df.empty:
             return None, None
 
+        # 先裁到目标窗口，再取末端 n_days。
+        df = df[(df.index >= start_dt) & (df.index <= end_dt)]
+        if df.empty:
+            return None, None
+
         # 取最近 n_days 个交易日
-        df = df.sort_index().tail(n_days)
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_index()
+        df = df.tail(n_days)
         if len(df) < n_days * 0.8:  # 至少 80% 数据
             return None, None
 
@@ -977,6 +1009,7 @@ class StockSelector:
         if not force and self._all_caches_exist(symbols):
             print(f'\n✅ 所有缓存已存在（{total} 只），跳过 API 预加载。')
             self._warmup_memory_caches(symbols)
+            self._daily_data_local_only = True
             print(f'   如需强制更新请设置 preload_all_data(force=True) 或删除缓存目录。\n')
             return total
 
@@ -1036,15 +1069,23 @@ class StockSelector:
             if idx % 20 == 0:
                 print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
             try:
-                _ = self.dm.get_stock_data(
+                df_kline = self.dm.get_stock_data(
                     symbol=sym,
                     start_date=start_date,
                     end_date=end_date or datetime.now().strftime('%Y%m%d'),
                     adjust='qfq',
                 )
+                if df_kline is None or df_kline.empty:
+                    self._kline_no_data_symbols.add(sym)
+                else:
+                    self._kline_cache[sym] = df_kline
+                    self._kline_no_data_symbols.discard(sym)
             except Exception:
                 pass
         print(f'    {total}/{total} (100%) 完成')
+
+        # 预加载完成后，选股阶段只读本地日线，避免再次触发 Tushare。
+        self._daily_data_local_only = True
 
         print(f'\n✅ 预加载全部完成！共 {total} 只股票，后续选股将直接使用本地缓存。\n')
         return total
@@ -1217,7 +1258,7 @@ if __name__ == '__main__':
     report_path = report_dir / f'stock_selection_results_{timestamp}.xlsx'
 
     df_results = sel.run_monthly(
-        start_date='20260501',
+        start_date='20260101',
         end_date='20260713',
         output_excel=str(report_path),
         verbose=True,
