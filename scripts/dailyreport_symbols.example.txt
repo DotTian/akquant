@@ -1,0 +1,13 @@
+# DailyReport symbols file
+# One symbol per line, comments start with '#'
+
+000807
+688131
+002901
+002755
+000933
+688629
+301393
+301095
+002738
+301358
