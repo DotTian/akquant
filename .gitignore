@@ -44,3 +44,4 @@ plans/
 /scripts/tsdata/
 /scripts/stock_info/
 /scripts/fundamentals_cache/
+*.tgz
