@@ -1247,7 +1247,8 @@ if __name__ == '__main__':
         token=token,
         # industries=DEFAULT_MEDICAL_INDUSTRIES,
         #industries=['医疗保健', '化学制药', '生物制药', '医药商业'],
-        industries=['半导体', '元器件'],
+        # 关注四个大行业，半导体，医药，金属，化工
+        industries=['半导体', '元器件','医疗保健', '化学制药', '生物制药', '医药商业', '工业金属','小金属','贵金属','能源金属', '化学制品', '化学原料' ],
         request_interval=0.32,
     )
 
@@ -1259,7 +1260,7 @@ if __name__ == '__main__':
     report_path = report_dir / f'stock_selection_results_{timestamp}.xlsx'
 
     df_results = sel.run_monthly(
-        start_date='20200101',
+        start_date='20260101',
         end_date='20260715',
         output_excel=str(report_path),
         verbose=True,
