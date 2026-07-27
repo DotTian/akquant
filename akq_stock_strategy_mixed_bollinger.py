@@ -403,12 +403,25 @@ def build_fundamental_universe(
     return selected
 
 
+def _normalize_symbol(symbol: object) -> str:
+    code = str(symbol).strip().upper()
+    if "." in code:
+        code = code.split(".", 1)[0]
+    return code.zfill(6)
+
+
+def _is_bj_symbol(symbol: object) -> bool:
+    code = _normalize_symbol(symbol)
+    return code.startswith(("43", "83", "87", "88", "92"))
+
+
 def build_weekly_universe(
     token: str,
     start_date: str,
     end_date: str,
     data_dir: str = "selector_data",
     preload: bool = True,
+    use_weekly_cache: bool = True,
 ) -> tuple[dict[str, set[str]], dict[str, str]]:
     """按周构建基本面候选池：仅影响买入门控，不强制卖出。"""
 
@@ -435,6 +448,14 @@ def build_weekly_universe(
         request_interval=0.32,
     )
 
+    cache_dir = (
+        Path(data_dir)
+        / "weekly_universe_cache"
+        / f"{start_date}_{end_date}"
+    )
+    if use_weekly_cache:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
     start_ts = pd.to_datetime(start_date)
     end_ts = pd.to_datetime(end_date)
     weekly_dates = list(pd.date_range(start=start_ts, end=end_ts, freq="W-MON"))
@@ -457,19 +478,59 @@ def build_weekly_universe(
 
     universe_by_week: dict[str, set[str]] = {}
     industry_by_symbol: dict[str, str] = {}
+    cache_hits = 0
+    cache_misses = 0
 
     t_all = time.time()
     for idx, dt in enumerate(weekly_dates, start=1):
         t_week = time.time()
         td = dt.strftime("%Y%m%d")
-        print(f"\n⏳ [周度选股 {idx}/{len(weekly_dates)}] {td} 开始...")
-        # 首周打开详细日志，后续以摘要进度为主。
-        df = _run_with_heartbeat(
-            task_name=f"周度选股 {idx}/{len(weekly_dates)} ({td})",
-            fn=selector.select,
-            trade_date=td,
-            verbose=(idx == 1),
-        )
+        cache_file = cache_dir / f"{td}.csv"
+        df: pd.DataFrame
+
+        if use_weekly_cache and cache_file.exists():
+            try:
+                df = pd.read_csv(cache_file, dtype={"symbol": "string", "industry": "string"})
+                cache_hits += 1
+                elapsed = time.time() - t_week
+                print(
+                    f"\n♻️ [周度选股 {idx}/{len(weekly_dates)}] {td} 命中缓存: "
+                    f"{len(df)} 只, 耗时 {elapsed:.1f}s"
+                )
+            except Exception:
+                # 缓存损坏时自动回退为实时重算。
+                print(f"\n⚠️ [周度选股 {idx}/{len(weekly_dates)}] {td} 缓存读取失败，改为实时重算")
+                df = _run_with_heartbeat(
+                    task_name=f"周度选股 {idx}/{len(weekly_dates)} ({td})",
+                    fn=selector.select,
+                    trade_date=td,
+                    verbose=(idx == 1),
+                )
+                cache_misses += 1
+                cache_save = pd.DataFrame()
+                if df is not None and (not df.empty):
+                    keep_cols = [c for c in ["symbol", "industry"] if c in df.columns]
+                    if keep_cols:
+                        cache_save = df[keep_cols].copy()
+                cache_save.to_csv(cache_file, index=False, encoding="utf-8")
+        else:
+            print(f"\n⏳ [周度选股 {idx}/{len(weekly_dates)}] {td} 开始...")
+            # 首周打开详细日志，后续以摘要进度为主。
+            df = _run_with_heartbeat(
+                task_name=f"周度选股 {idx}/{len(weekly_dates)} ({td})",
+                fn=selector.select,
+                trade_date=td,
+                verbose=(idx == 1),
+            )
+            cache_misses += 1
+            if use_weekly_cache:
+                cache_save = pd.DataFrame()
+                if df is not None and (not df.empty):
+                    keep_cols = [c for c in ["symbol", "industry"] if c in df.columns]
+                    if keep_cols:
+                        cache_save = df[keep_cols].copy()
+                cache_save.to_csv(cache_file, index=False, encoding="utf-8")
+
         week_key = MixedBollingerStrategy._week_key_from_date(dt.normalize())
         if df is None or df.empty:
             universe_by_week[week_key] = set()
@@ -477,15 +538,20 @@ def build_weekly_universe(
             print(f"✅ [周度选股 {idx}/{len(weekly_dates)}] {td} 完成: 0 只, 耗时 {elapsed:.1f}s")
             continue
 
-        symbols = set(df["symbol"].astype(str).str.zfill(6).tolist())
+        before_filter = len(df)
+        df = df[~df["symbol"].map(_is_bj_symbol)].copy()
+        filtered_bj = before_filter - len(df)
+
+        symbols = set(df["symbol"].map(_normalize_symbol).tolist())
         universe_by_week[week_key] = symbols
         for _, row in df[["symbol", "industry"]].iterrows():
-            industry_by_symbol[str(row["symbol"]).zfill(6)] = str(row["industry"])
+            industry_by_symbol[_normalize_symbol(row["symbol"])] = str(row["industry"])
 
         elapsed = time.time() - t_week
         print(
             f"✅ [周度选股 {idx}/{len(weekly_dates)}] {td} 完成: "
-            f"{len(symbols)} 只, 耗时 {elapsed:.1f}s"
+            f"{len(symbols)} 只"
+            f"{', 排除北交所 ' + str(filtered_bj) + ' 只' if filtered_bj else ''}, 耗时 {elapsed:.1f}s"
         )
 
     if not universe_by_week:
@@ -496,6 +562,10 @@ def build_weekly_universe(
         f"累计标的 {len({s for v in universe_by_week.values() for s in v})} 只, "
         f"总耗时 {time.time() - t_all:.1f}s"
     )
+    if use_weekly_cache:
+        print(
+            f"   缓存统计: 命中 {cache_hits} 周, 新计算 {cache_misses} 周, 目录={cache_dir}"
+        )
 
     return universe_by_week, industry_by_symbol
 
@@ -810,7 +880,7 @@ def main() -> None:
     if not token:
         raise RuntimeError("请先设置环境变量 TUSHARE_TOKEN")
 
-    start_date = "20220101"
+    start_date = "20260101"
     end_date = "20260727"
     data_dir = "tsdata"
 

@@ -53,8 +53,15 @@ class FundamentalsManager:
 
     # ─── 工具方法 ───
     @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        code = str(symbol).strip().upper()
+        if '.' in code:
+            code = code.split('.', 1)[0]
+        return code.zfill(6)
+
+    @staticmethod
     def to_ts_code(symbol: str) -> str:
-        code = str(symbol).zfill(6)
+        code = FundamentalsManager.normalize_symbol(symbol)
         if code.startswith(('43', '83', '87', '88', '92')):
             return f"{code}.BJ"
         if code.startswith(('688', '600', '601', '603', '605')):
@@ -80,12 +87,12 @@ class FundamentalsManager:
 
     # ─── 获取利润表数据 (含净利润/营收/研发费用) ───
     def get_income(self, symbol: str) -> Optional[pd.DataFrame]:
-        symbol_key = str(symbol).zfill(6)
+        symbol_key = self.normalize_symbol(symbol)
         if symbol_key in self._income_cache:
             return self._income_cache[symbol_key]
 
         ts_code = self.to_ts_code(symbol)
-        cache_key = f"income_{symbol}"
+        cache_key = f"income_{symbol_key}"
         df = self._load_cache(cache_key)
         if df is not None:
             self._income_cache[symbol_key] = df
@@ -110,12 +117,12 @@ class FundamentalsManager:
 
     # ─── 获取财务指标数据 (含毛利率/净利率/净利润增长率) ───
     def get_fina_indicator(self, symbol: str) -> Optional[pd.DataFrame]:
-        symbol_key = str(symbol).zfill(6)
+        symbol_key = self.normalize_symbol(symbol)
         if symbol_key in self._fina_cache:
             return self._fina_cache[symbol_key]
 
         ts_code = self.to_ts_code(symbol)
-        cache_key = f"fina_{symbol}"
+        cache_key = f"fina_{symbol_key}"
         df = self._load_cache(cache_key)
         if df is not None:
             self._fina_cache[symbol_key] = df

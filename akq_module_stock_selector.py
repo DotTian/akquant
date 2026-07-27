@@ -135,6 +135,10 @@ class StockSelector:
         self._kline_cache: Dict[str, pd.DataFrame] = {}
         self._kline_no_data_symbols: Set[str] = set()
         self._daily_data_local_only: bool = False
+        self._turnover_amp_cache: Dict[str, pd.DataFrame] = {}
+        self._goodwill_ratio_cache: Dict[str, Optional[float]] = {}
+        self._fina_static_cache: Dict[str, dict] = {}
+        self._income_annual_loss_cache: Dict[str, pd.DataFrame] = {}
 
         logger.info(
             f'StockSelector 初始化完成，目标行业: {len(self.industries)} 个'
@@ -151,6 +155,18 @@ class StockSelector:
             lambda n: any(k in n for k in self.battery_keywords)
         )
         return candidates[industry_mask | keyword_mask].copy()
+
+    @staticmethod
+    def _normalize_symbol(symbol: object) -> str:
+        code = str(symbol).strip().upper()
+        if '.' in code:
+            code = code.split('.', 1)[0]
+        return code.zfill(6)
+
+    @classmethod
+    def _is_bj_symbol(cls, symbol: object) -> bool:
+        code = cls._normalize_symbol(symbol)
+        return code.startswith(('43', '83', '87', '88', '92'))
 
     # ========================================================================
     # 工具方法
@@ -190,6 +206,62 @@ class StockSelector:
 
     def _save_pickle_cache(self, key: str, df: pd.DataFrame):
         df.to_parquet(self._cache_path(key), index=False)
+
+    def _build_turnover_amplitude_series(self, symbol: str, n_days: int = 60) -> Optional[pd.DataFrame]:
+        """基于单票日线一次性预计算滚动 60 日成交额/振幅特征序列。"""
+        if n_days != 60:
+            return None
+
+        ck = f'turnover_amp_{n_days}_{symbol}'
+        if symbol in self._turnover_amp_cache:
+            return self._turnover_amp_cache[symbol]
+
+        cached = self._load_pickle_cache(ck)
+        if cached is not None and not cached.empty:
+            try:
+                cached = cached.copy()
+                cached['trade_date'] = pd.to_datetime(cached['trade_date'])
+                cached = cached.sort_values('trade_date').set_index('trade_date')
+                self._turnover_amp_cache[symbol] = cached
+                return cached
+            except Exception:
+                pass
+
+        df = self._kline_cache.get(symbol)
+        if df is None or df.empty:
+            return None
+
+        k = df.copy()
+        if not k.index.is_monotonic_increasing:
+            k = k.sort_index()
+
+        if 'volume' not in k.columns or 'close' not in k.columns:
+            return None
+
+        # 成交额（万元）
+        amount_wan = (k['volume'] * 100 * k['close']) / 10000.0
+        avg_amount_60d = amount_wan.rolling(n_days, min_periods=max(10, int(n_days * 0.8))).mean()
+
+        # 振幅（%）
+        if 'high' in k.columns and 'low' in k.columns:
+            amplitude = ((k['high'] - k['low']) / k['close'].shift(1)) * 100.0
+            avg_amp_60d = amplitude.rolling(n_days, min_periods=max(10, int(n_days * 0.8))).mean()
+        else:
+            avg_amp_60d = pd.Series(index=k.index, dtype='float64')
+
+        feat = pd.DataFrame(
+            {
+                'avg_amount_60d': avg_amount_60d,
+                'avg_amplitude_60d': avg_amp_60d,
+            },
+            index=k.index,
+        )
+        feat.index.name = 'trade_date'
+        feat = feat.reset_index()
+        self._save_pickle_cache(ck, feat)
+        feat = feat.set_index('trade_date')
+        self._turnover_amp_cache[symbol] = feat
+        return feat
 
     # ========================================================================
     # 行业发现
@@ -401,8 +473,20 @@ class StockSelector:
 
     def get_goodwill_ratio(self, symbol: str) -> Optional[float]:
         """商誉 / 归母净资产 (%)"""
+        if symbol in self._goodwill_ratio_cache:
+            return self._goodwill_ratio_cache[symbol]
+
+        ck = f'goodwill_ratio_{symbol}'
+        cached = self._load_pickle_cache(ck)
+        if cached is not None and not cached.empty:
+            val = cached.iloc[0].get('goodwill_ratio')
+            result = None if val is None or pd.isna(val) else float(val)
+            self._goodwill_ratio_cache[symbol] = result
+            return result
+
         df = self._get_balance_sheet(symbol)
         if df is None or df.empty:
+            self._goodwill_ratio_cache[symbol] = None
             return None
         latest = df.sort_values('end_date', ascending=False).iloc[0]
         gw = latest.get('goodwill')
@@ -414,8 +498,80 @@ class StockSelector:
             and pd.notna(eq)
             and eq > 0
         ):
-            return round(float(gw) / float(eq) * 100, 2)
+            result = round(float(gw) / float(eq) * 100, 2)
+            self._goodwill_ratio_cache[symbol] = result
+            self._save_pickle_cache(ck, pd.DataFrame([{'goodwill_ratio': result}]))
+            return result
+        self._goodwill_ratio_cache[symbol] = None
+        self._save_pickle_cache(ck, pd.DataFrame([{'goodwill_ratio': np.nan}]))
         return None
+
+    def _get_fina_static_features(self, symbol: str, years: int = 3) -> dict:
+        """财务静态特征：最新毛利率、近N年毛利率斜率（按股票预计算并缓存）。"""
+        if symbol in self._fina_static_cache:
+            return self._fina_static_cache[symbol]
+
+        ck = f'fina_static_{symbol}_{years}y'
+        cached = self._load_pickle_cache(ck)
+        if cached is not None and not cached.empty:
+            latest_gm_raw = cached.iloc[0].get('latest_gross_margin')
+            slope_raw = cached.iloc[0].get('gm_slope')
+            feat = {
+                'latest_gross_margin': None if latest_gm_raw is None or pd.isna(latest_gm_raw) else float(latest_gm_raw),
+                'gm_slope': None if slope_raw is None or pd.isna(slope_raw) else float(slope_raw),
+            }
+            self._fina_static_cache[symbol] = feat
+            return feat
+
+        feat: Dict[str, Optional[float]] = {'latest_gross_margin': None, 'gm_slope': None}
+        df = self.fm.get_fina_indicator(symbol)
+        if df is None or df.empty or ('grossprofit_margin' not in df.columns):
+            self._fina_static_cache[symbol] = feat
+            self._save_pickle_cache(
+                ck,
+                pd.DataFrame([{'latest_gross_margin': np.nan, 'gm_slope': np.nan}]),
+            )
+            return feat
+
+        d = df[['end_date', 'grossprofit_margin']].dropna().copy()
+        if d.empty:
+            self._fina_static_cache[symbol] = feat
+            self._save_pickle_cache(
+                ck,
+                pd.DataFrame([{'latest_gross_margin': np.nan, 'gm_slope': np.nan}]),
+            )
+            return feat
+
+        d['end_date'] = pd.to_datetime(d['end_date'])
+        d = d.sort_values('end_date')
+
+        latest_val = d.iloc[-1]['grossprofit_margin']
+        if pd.notna(latest_val):
+            feat['latest_gross_margin'] = float(latest_val)
+
+        cutoff = datetime.now() - timedelta(days=years * 365)
+        recent = d[d['end_date'] > pd.Timestamp(cutoff)]
+        if len(recent) >= 3:
+            x = np.arange(len(recent))
+            y = recent['grossprofit_margin'].astype(float).to_numpy()
+            valid = np.isfinite(y)
+            if valid.sum() >= 3:
+                slope, _ = np.polyfit(x[valid], y[valid], 1)
+                feat['gm_slope'] = round(float(slope), 4)
+
+        self._fina_static_cache[symbol] = feat
+        self._save_pickle_cache(
+            ck,
+            pd.DataFrame(
+                [
+                    {
+                        'latest_gross_margin': feat['latest_gross_margin'] if feat['latest_gross_margin'] is not None else np.nan,
+                        'gm_slope': feat['gm_slope'] if feat['gm_slope'] is not None else np.nan,
+                    }
+                ]
+            ),
+        )
+        return feat
 
     def get_historical_gross_margins(
         self, symbol: str
@@ -434,20 +590,9 @@ class StockSelector:
 
     def calc_gross_margin_slope(self, symbol: str, years: int = 3) -> Optional[float]:
         """近 N 年毛利率线性回归斜率"""
-        margins = self.get_historical_gross_margins(symbol)
-        if margins is None or len(margins) < 3:
-            return None
-        cutoff = datetime.now() - timedelta(days=years * 365)
-        recent = [m for m in margins if m['end_date'] > pd.Timestamp(cutoff)]
-        if len(recent) < 3:
-            return None
-        x = np.arange(len(recent))
-        y = np.array([m['gross_margin'] for m in recent], dtype=float)
-        valid = np.isfinite(y)
-        if valid.sum() < 3:
-            return None
-        slope, _ = np.polyfit(x[valid], y[valid], 1)
-        return round(float(slope), 4)
+        feat = self._get_fina_static_features(symbol, years=years)
+        val = feat.get('gm_slope')
+        return None if val is None else float(val)
 
     # ========================================================================
     # 60 日成交额 & 振幅
@@ -461,6 +606,20 @@ class StockSelector:
         日均振幅   = mean((high - low) / pre_close) * 100
         """
         end = trade_date.replace('-', '')
+        end_dt = pd.to_datetime(end)
+
+        # 优先读取“下载后一次性预计算”的滚动特征缓存。
+        feat = self._build_turnover_amplitude_series(symbol, n_days=n_days)
+        if feat is not None and (not feat.empty):
+            hist = feat[feat.index <= end_dt]
+            if not hist.empty:
+                row = hist.iloc[-1]
+                amt = row.get('avg_amount_60d')
+                amp = row.get('avg_amplitude_60d')
+                amt_v = None if pd.isna(amt) else round(float(amt), 2)
+                amp_v = None if pd.isna(amp) else float(amp)
+                return amt_v, amp_v
+
         # 往前推足够多的自然日
         start = (
             pd.to_datetime(trade_date) - timedelta(days=n_days * 3)
@@ -492,6 +651,9 @@ class StockSelector:
                     return None, None
                 self._kline_cache[symbol] = df
                 self._kline_no_data_symbols.discard(symbol)
+                self._turnover_amp_cache.pop(symbol, None)
+                # 新日线覆盖后重建特征缓存（一次性），后续周度只读。
+                self._build_turnover_amplitude_series(symbol, n_days=n_days)
             except Exception as e:
                 logger.debug(f'{symbol} 日线获取失败: {e}')
                 if ('空数据' in str(e)) or ('empty' in str(e).lower()):
@@ -538,20 +700,50 @@ class StockSelector:
         判断最近一个完整财年年报是否亏损。
         trade_date 对应日期，找该日期之前最近一个 12-31 年报的 n_income_attr_p。
         """
-        df = self.fm.get_income(symbol)
-        if df is None or df.empty:
+        if symbol in self._income_annual_loss_cache:
+            annual = self._income_annual_loss_cache[symbol]
+        else:
+            ck = f'income_annual_loss_{symbol}'
+            cached = self._load_pickle_cache(ck)
+            if cached is not None and not cached.empty and {'end_date', 'is_loss'}.issubset(set(cached.columns)):
+                annual = cached.copy()
+                annual['end_date'] = pd.to_datetime(annual['end_date'])
+                annual = annual.sort_values('end_date').reset_index(drop=True)
+            else:
+                df = self.fm.get_income(symbol)
+                if df is None or df.empty:
+                    return None
+                cols = [c for c in ['end_date', 'n_income_attr_p'] if c in df.columns]
+                if len(cols) < 2:
+                    return None
+                annual = df[cols].copy()
+                annual['end_date'] = pd.to_datetime(annual['end_date'])
+                # 仅使用年报，降低噪声与重复计算。
+                annual = annual[
+                    (annual['end_date'].dt.month == 12)
+                    & (annual['end_date'].dt.day == 31)
+                ].copy()
+                if annual.empty:
+                    return None
+                annual['is_loss'] = annual['n_income_attr_p'].apply(
+                    lambda v: np.nan if (v is None or pd.isna(v)) else (float(v) < 0)
+                )
+                annual = annual[['end_date', 'is_loss']].sort_values('end_date').reset_index(drop=True)
+                self._save_pickle_cache(ck, annual)
+            self._income_annual_loss_cache[symbol] = annual
+
+        if annual is None or annual.empty:
             return None
+
         target = pd.to_datetime(trade_date.replace('-', ''))
-        # 年报通常 end_date 是 12-31，取 target 之前最近的年报
-        df = df[df['end_date'] <= target].sort_values('end_date')
-        if df.empty:
+        end_vals = annual['end_date'].to_numpy()
+        pos = int(np.searchsorted(end_vals, np.datetime64(target), side='right')) - 1
+        if pos < 0:
             return None
-        # 取最近一条
-        latest = df.iloc[-1]
-        ni = latest.get('n_income_attr_p')
-        if ni is not None and pd.notna(ni):
-            return float(ni) < 0
-        return None
+        loss_val = annual.iloc[pos].get('is_loss')
+        if loss_val is None or pd.isna(loss_val):
+            return None
+        return bool(loss_val)
 
     # ========================================================================
     # ST/退市检查（独立实现，带频率控制 + 内存缓存 + 磁盘缓存）
@@ -805,15 +997,9 @@ class StockSelector:
         for i, sym in enumerate(candidates['symbol']):
             if verbose and (i % 10 == 0):
                 print(f'  获取基本面数据: {i+1}/{len(candidates)}')
-            # 毛利率（从 fina_indicator 最新一期获取）
-            df_fina = self.fm.get_fina_indicator(sym)
-            if df_fina is not None and not df_fina.empty:
-                latest_f = df_fina.sort_values('end_date', ascending=False).iloc[0]
-                gross_margins[sym] = float(latest_f['grossprofit_margin']) if pd.notna(latest_f.get('grossprofit_margin')) else None
-            else:
-                gross_margins[sym] = None
-            # 毛利率 3 年趋势
-            gm_slopes[sym] = self.calc_gross_margin_slope(sym, years=3)
+            feat = self._get_fina_static_features(sym, years=3)
+            gross_margins[sym] = feat.get('latest_gross_margin')
+            gm_slopes[sym] = feat.get('gm_slope')
 
         candidates['gross_margin'] = candidates['symbol'].map(gross_margins)
         candidates['gm_slope'] = candidates['symbol'].map(gm_slopes)
@@ -823,7 +1009,7 @@ class StockSelector:
         industry_avg_gm = {}
         for ind in candidates['industry'].unique():
             ind_mask = candidates['industry'] == ind
-            ind_gm = candidates.loc[ind_mask, 'gross_margin'].dropna()
+            ind_gm = pd.Series(candidates.loc[ind_mask, 'gross_margin']).dropna()
             if len(ind_gm) > 0:
                 industry_avg_gm[ind] = ind_gm.mean()
             else:
@@ -915,6 +1101,7 @@ class StockSelector:
         """检查所有核心缓存文件是否存在（任一缺失则返回 False）"""
         cache_keys = ['listing_status', 'daily_basic', 'pledge', 'bs', 'fina', 'income']
         for sym in symbols:
+            fm_symbol = self.fm.normalize_symbol(sym)
             for prefix in cache_keys:
                 p = self._cache_path(f'{prefix}_{sym}')
                 # 注意：FundamentalsManager 的缓存路径不在 self.cache_dir 下
@@ -924,7 +1111,7 @@ class StockSelector:
                         return False
                 # fm 的缓存文件名不同，单独检查
                 else:
-                    fm_path = self.fm.cache_dir / f'{prefix}_{sym}.parquet'
+                    fm_path = self.fm.cache_dir / f'{prefix}_{fm_symbol}.parquet'
                     if not fm_path.exists():
                         return False
         return True
@@ -945,6 +1132,10 @@ class StockSelector:
             _ = self._get_balance_sheet(sym)    # 内存+磁盘 → 入 mem
             _ = self.fm.get_fina_indicator(sym) # fm 内存+磁盘 → 入 fm mem
             _ = self.fm.get_income(sym)         # fm 内存+磁盘 → 入 fm mem
+            _ = self.get_goodwill_ratio(sym)
+            _ = self._get_fina_static_features(sym, years=3)
+            _ = self.is_last_fiscal_year_loss(sym, datetime.now().strftime('%Y%m%d'))
+            _ = self._build_turnover_amplitude_series(sym, n_days=60)
         print(f'    {len(symbols)}/{len(symbols)} (100%) 完成')
 
     # ========================================================================
@@ -976,10 +1167,12 @@ class StockSelector:
             candidates = candidates[candidates['industry'].isin(sectors)]
         else:
             candidates = self._apply_industry_filter(candidates)
+        bj_count = int(candidates['symbol'].map(self._is_bj_symbol).sum()) if not candidates.empty else 0
+        if bj_count > 0:
+            candidates = candidates[~candidates['symbol'].map(self._is_bj_symbol)].copy()
         symbols = (
             candidates['symbol']
-            .astype(str)
-            .str.zfill(6)
+            .map(self._normalize_symbol)
             .tolist()
         )
         total = len(symbols)
@@ -993,6 +1186,8 @@ class StockSelector:
             return total
 
         print(f'\n🚀 预加载 {total} 只股票数据到本地缓存...')
+        if bj_count > 0:
+            print(f'   已在预加载前排除北交所股票: {bj_count} 只')
 
         # 1. ST/退市
         print('  [1/7] 预加载 ST/退市状态...')
@@ -1032,6 +1227,7 @@ class StockSelector:
             if idx % 20 == 0:
                 print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
             _ = self.fm.get_fina_indicator(sym)
+            _ = self._get_fina_static_features(sym, years=3)
         print(f'    {total}/{total} (100%) 完成')
 
         # 6. 利润表（净利润）
@@ -1040,6 +1236,7 @@ class StockSelector:
             if idx % 20 == 0:
                 print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
             _ = self.fm.get_income(sym)
+            _ = self.is_last_fiscal_year_loss(sym, datetime.now().strftime('%Y%m%d'))
         print(f'    {total}/{total} (100%) 完成')
 
         # 7. 日线数据（成交额/振幅）
@@ -1059,6 +1256,8 @@ class StockSelector:
                 else:
                     self._kline_cache[sym] = df_kline
                     self._kline_no_data_symbols.discard(sym)
+                    self._turnover_amp_cache.pop(sym, None)
+                    self._build_turnover_amplitude_series(sym, n_days=60)
             except Exception:
                 pass
         print(f'    {total}/{total} (100%) 完成')
