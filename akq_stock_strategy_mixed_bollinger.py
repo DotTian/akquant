@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 from datetime import datetime
@@ -499,6 +500,299 @@ def build_weekly_universe(
     return universe_by_week, industry_by_symbol
 
 
+def _safe_result_df(result, attr: str) -> pd.DataFrame:
+    df = getattr(result, attr, None)
+    if isinstance(df, pd.DataFrame):
+        return df.copy()
+    return pd.DataFrame()
+
+
+def _build_run_summary_md(
+    run_id: str,
+    metrics_df: pd.DataFrame,
+    orders_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    executions_df: pd.DataFrame,
+    top_n: int = 20,
+) -> str:
+    key_metrics: dict[str, object] = {
+        "start_time": None,
+        "end_time": None,
+        "total_return_pct": None,
+        "annual_return_pct": None,
+        "max_drawdown_pct": None,
+        "sharpe": None,
+        "sortino": None,
+        "win_rate": None,
+        "total_trades": None,
+    }
+    if not metrics_df.empty and "value" in metrics_df.columns:
+        for k in list(key_metrics.keys()):
+            if k in metrics_df.index:
+                key_metrics[k] = metrics_df.at[k, "value"]
+
+    filled_orders = pd.DataFrame()
+    rejected_orders = pd.DataFrame()
+    if not orders_df.empty and "status" in orders_df.columns:
+        filled_orders = orders_df[orders_df["status"].isin(["filled", "partially_filled"])]
+        rejected_orders = orders_df[orders_df["status"] == "rejected"]
+
+    buy_exec = pd.DataFrame()
+    if not executions_df.empty and "side" in executions_df.columns:
+        buy_exec = executions_df[executions_df["side"].astype(str).str.lower() == "buy"].copy()
+
+    if not buy_exec.empty and "symbol" in buy_exec.columns:
+        buy_symbols = (
+            buy_exec.groupby("symbol")
+            .size()
+            .reset_index(name="buy_exec_count")
+            .sort_values("buy_exec_count", ascending=False)
+        )
+    else:
+        buy_symbols = pd.DataFrame(columns=["symbol", "buy_exec_count"])
+
+    lines: list[str] = []
+    lines.append(f"# Mixed Bollinger 回测摘要")
+    lines.append("")
+    lines.append(f"- run_id: {run_id}")
+    lines.append(f"- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+
+    lines.append("## 核心指标")
+    lines.append("")
+    for k, v in key_metrics.items():
+        lines.append(f"- {k}: {v}")
+    lines.append("")
+
+    lines.append("## 交易概况")
+    lines.append("")
+    lines.append(f"- 订单总数: {len(orders_df)}")
+    lines.append(f"- 成交/部分成交订单数: {len(filled_orders)}")
+    lines.append(f"- 拒单数: {len(rejected_orders)}")
+    lines.append(f"- 平仓交易数: {len(trades_df)}")
+    lines.append(f"- 买入成交笔数: {len(buy_exec)}")
+    lines.append("")
+
+    lines.append("## 买入标的（按成交笔数）")
+    lines.append("")
+    if buy_symbols.empty:
+        lines.append("无买入成交记录")
+    else:
+        lines.append(buy_symbols.head(top_n).to_markdown(index=False))
+    lines.append("")
+
+    lines.append("## 最近平仓交易")
+    lines.append("")
+    if trades_df.empty:
+        lines.append("无平仓交易记录")
+    else:
+        view_cols = [
+            c
+            for c in [
+                "symbol",
+                "entry_time",
+                "exit_time",
+                "quantity",
+                "entry_price",
+                "exit_price",
+                "net_pnl",
+                "return_pct",
+            ]
+            if c in trades_df.columns
+        ]
+        t = trades_df.sort_values(by="exit_time", ascending=False).head(top_n)
+        lines.append(t[view_cols].to_markdown(index=False))
+    lines.append("")
+
+    if not rejected_orders.empty:
+        lines.append("## 拒单原因统计")
+        lines.append("")
+        if "reject_reason" in rejected_orders.columns:
+            rr = (
+                rejected_orders["reject_reason"]
+                .fillna("unknown")
+                .astype(str)
+                .value_counts()
+                .rename_axis("reason")
+                .reset_index(name="count")
+                .head(top_n)
+            )
+            lines.append(rr.to_markdown(index=False))
+        else:
+            lines.append("无 reject_reason 列")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _build_run_summary_html(
+    run_id: str,
+    metrics_df: pd.DataFrame,
+    orders_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    executions_df: pd.DataFrame,
+    top_n: int = 20,
+) -> str:
+    def _tbl(df: pd.DataFrame) -> str:
+        if df.empty:
+            return "<p><em>无数据</em></p>"
+        return df.to_html(index=False, border=0)
+
+    key = pd.DataFrame()
+    if not metrics_df.empty and "value" in metrics_df.columns:
+        keep = [
+            "start_time",
+            "end_time",
+            "total_return_pct",
+            "annual_return_pct",
+            "max_drawdown_pct",
+            "sharpe",
+            "sortino",
+            "win_rate",
+            "total_trades",
+        ]
+        rows = []
+        for k in keep:
+            if k in metrics_df.index:
+                rows.append({"metric": k, "value": metrics_df.at[k, "value"]})
+        key = pd.DataFrame(rows)
+
+    buy_symbols = pd.DataFrame()
+    if not executions_df.empty and "side" in executions_df.columns and "symbol" in executions_df.columns:
+        buy_exec = executions_df[executions_df["side"].astype(str).str.lower() == "buy"]
+        if not buy_exec.empty:
+            buy_symbols = (
+                buy_exec.groupby("symbol")
+                .size()
+                .reset_index(name="buy_exec_count")
+                .sort_values("buy_exec_count", ascending=False)
+                .head(top_n)
+            )
+
+    trade_view = pd.DataFrame()
+    if not trades_df.empty:
+        view_cols = [
+            c
+            for c in [
+                "symbol",
+                "entry_time",
+                "exit_time",
+                "quantity",
+                "entry_price",
+                "exit_price",
+                "net_pnl",
+                "return_pct",
+            ]
+            if c in trades_df.columns
+        ]
+        trade_view = trades_df.sort_values(by="exit_time", ascending=False).head(top_n)[view_cols]
+
+    rej = pd.DataFrame()
+    if not orders_df.empty and "status" in orders_df.columns:
+        rj = orders_df[orders_df["status"] == "rejected"]
+        if not rj.empty and "reject_reason" in rj.columns:
+            rej = (
+                rj["reject_reason"]
+                .fillna("unknown")
+                .astype(str)
+                .value_counts()
+                .rename_axis("reason")
+                .reset_index(name="count")
+                .head(top_n)
+            )
+
+    return f"""<!doctype html>
+<html lang=\"zh-CN\">
+<head>
+  <meta charset=\"utf-8\" />
+  <title>Mixed Bollinger 回测摘要 - {run_id}</title>
+  <style>
+    body {{ font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; margin: 24px; color:#222; }}
+    h1,h2 {{ margin: 12px 0; }}
+    table {{ border-collapse: collapse; width: 100%; margin: 8px 0 18px; }}
+    th, td {{ border: 1px solid #ddd; padding: 6px 8px; font-size: 13px; text-align: left; }}
+    th {{ background: #f6f8fa; }}
+    .meta {{ color: #666; margin-bottom: 16px; }}
+  </style>
+</head>
+<body>
+  <h1>Mixed Bollinger 回测摘要</h1>
+  <div class=\"meta\">run_id: {run_id} | 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+
+  <h2>核心指标</h2>
+  {_tbl(key)}
+
+  <h2>买入标的（按成交笔数）</h2>
+  {_tbl(buy_symbols)}
+
+  <h2>最近平仓交易</h2>
+  {_tbl(trade_view)}
+
+  <h2>拒单原因统计</h2>
+  {_tbl(rej)}
+</body>
+</html>
+"""
+
+
+def export_backtest_artifacts(
+    result,
+    report_dir: Path,
+    run_id: str,
+) -> dict[str, str]:
+    run_dir = report_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics_df = _safe_result_df(result, "metrics_df")
+    orders_df = _safe_result_df(result, "orders_df")
+    trades_df = _safe_result_df(result, "trades_df")
+    positions_df = _safe_result_df(result, "positions_df")
+    executions_df = _safe_result_df(result, "executions_df")
+
+    metrics_df.to_parquet(run_dir / "metrics.parquet", index=True)
+    orders_df.to_parquet(run_dir / "orders.parquet", index=False)
+    trades_df.to_parquet(run_dir / "trades.parquet", index=False)
+    positions_df.to_parquet(run_dir / "positions.parquet", index=False)
+    executions_df.to_parquet(run_dir / "executions.parquet", index=False)
+
+    run_meta = {
+        "run_id": run_id,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "orders": int(len(orders_df)),
+        "trades": int(len(trades_df)),
+        "positions_rows": int(len(positions_df)),
+        "executions": int(len(executions_df)),
+    }
+    (run_dir / "run_meta.json").write_text(
+        json.dumps(run_meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    md_text = _build_run_summary_md(
+        run_id=run_id,
+        metrics_df=metrics_df,
+        orders_df=orders_df,
+        trades_df=trades_df,
+        executions_df=executions_df,
+    )
+    (run_dir / "summary.md").write_text(md_text, encoding="utf-8")
+
+    html_text = _build_run_summary_html(
+        run_id=run_id,
+        metrics_df=metrics_df,
+        orders_df=orders_df,
+        trades_df=trades_df,
+        executions_df=executions_df,
+    )
+    (run_dir / "summary.html").write_text(html_text, encoding="utf-8")
+
+    return {
+        "run_dir": str(run_dir),
+        "summary_md": str(run_dir / "summary.md"),
+        "summary_html": str(run_dir / "summary.html"),
+    }
+
+
 def main() -> None:
     token = os.getenv("TUSHARE_TOKEN")
     if not token:
@@ -573,6 +867,7 @@ def main() -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = report_dir / f"mixed_bollinger_adx_{timestamp}.html"
+    run_id = f"mixed_bollinger_adx_{timestamp}"
 
     plot_symbol = tradable_symbols[0] if tradable_symbols else None
     result.report(
@@ -583,7 +878,17 @@ def main() -> None:
         include_trade_kline=True,
         show=False,
     )
+
+    artifacts = export_backtest_artifacts(
+        result=result,
+        report_dir=report_dir,
+        run_id=run_id,
+    )
+
     print(f"\n报告已保存至: {report_path}")
+    print(f"结构化产物目录: {artifacts['run_dir']}")
+    print(f"摘要(MD): {artifacts['summary_md']}")
+    print(f"摘要(HTML): {artifacts['summary_html']}")
 
 
 if __name__ == "__main__":
