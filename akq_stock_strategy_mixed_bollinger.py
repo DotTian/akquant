@@ -749,7 +749,19 @@ def export_backtest_artifacts(
     positions_df = _safe_result_df(result, "positions_df")
     executions_df = _safe_result_df(result, "executions_df")
 
-    metrics_df.to_parquet(run_dir / "metrics.parquet", index=True)
+    # metrics_df 的 value 列是混合类型（含 timedelta），先转字符串再落 parquet。
+    metrics_parquet_df = metrics_df.copy()
+    if "value" in metrics_parquet_df.columns:
+        metrics_parquet_df["value"] = metrics_parquet_df["value"].map(
+            lambda v: None if pd.isna(v) else str(v)
+        )
+
+    metrics_parquet_path = run_dir / "metrics.parquet"
+    try:
+        metrics_parquet_df.to_parquet(metrics_parquet_path, index=True)
+    except Exception:
+        # 兜底输出 CSV，避免因 parquet 库兼容问题导致整次流程失败。
+        metrics_df.to_csv(run_dir / "metrics.csv", index=True)
     orders_df.to_parquet(run_dir / "orders.parquet", index=False)
     trades_df.to_parquet(run_dir / "trades.parquet", index=False)
     positions_df.to_parquet(run_dir / "positions.parquet", index=False)
