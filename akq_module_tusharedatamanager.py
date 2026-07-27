@@ -45,6 +45,7 @@ class TushareStockDataManager:
         # 缓存元数据文件
         self.meta_file = self.data_dir / "metadata.json"
         self.metadata = self._load_metadata()
+        self._trade_cal_cache = {}
         
         logger.info(f"Tushare 数据管理器初始化完成，数据目录: {self.data_dir}")
     
@@ -87,6 +88,10 @@ class TushareStockDataManager:
             return start_date, end_date
 
         exchange = self._infer_exchange(symbol)
+        cache_key = (exchange, start_date, end_date)
+        cached = self._trade_cal_cache.get(cache_key)
+        if cached is not None:
+            return cached
         try:
             self._wait_if_needed()
             cal_df = self.pro.trade_cal(
@@ -100,23 +105,36 @@ class TushareStockDataManager:
             return start_date, end_date
 
         if cal_df is None or cal_df.empty:
-            return start_date, end_date
+            result = (start_date, end_date)
+            self._trade_cal_cache[cache_key] = result
+            return result
 
         trade_dates = pd.to_datetime(cal_df['cal_date']).dt.strftime('%Y%m%d').tolist()
         if not trade_dates:
-            return start_date, end_date
+            result = (start_date, end_date)
+            self._trade_cal_cache[cache_key] = result
+            return result
 
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
         trade_dt = pd.to_datetime(trade_dates)
         valid = trade_dt[(trade_dt >= start_dt) & (trade_dt <= end_dt)]
         if valid.empty:
-            return '', ''
+            result = ('', '')
+            self._trade_cal_cache[cache_key] = result
+            return result
 
         aligned_start = valid.min().strftime('%Y%m%d')
         aligned_end = valid.max().strftime('%Y%m%d')
-        return aligned_start, aligned_end
+        result = (aligned_start, aligned_end)
+        self._trade_cal_cache[cache_key] = result
+        return result
     
+    @staticmethod
+    def _is_empty_data_error(err: Exception) -> bool:
+        msg = str(err)
+        return ('空数据' in msg) or ('empty' in msg.lower())
+
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:
         """规范化股票代码，去掉已有市场后缀后再转成 6 位数字代码。"""
@@ -301,19 +319,25 @@ class TushareStockDataManager:
                 logger.info(f"成功获取 {symbol} 数据: {len(df)} 条, "
                            f"日期范围 {df.index.min().strftime('%Y-%m-%d')} - {df.index.max().strftime('%Y-%m-%d')}")
                 
-                # 额外添加短暂延迟，避免连续请求
-                time.sleep(0.5)
-                
                 return df
                 
             except Exception as e:
-                logger.warning(f"获取失败 (尝试 {attempt+1}/{max_retries}): {symbol}, 错误: {e}")
+                if self._is_empty_data_error(e):
+                    # 空数据在部分标的/区间属于常见情况，避免刷屏告警。
+                    logger.debug(
+                        f"获取空数据 (尝试 {attempt+1}/{max_retries}): {symbol}, 错误: {e}"
+                    )
+                else:
+                    logger.warning(f"获取失败 (尝试 {attempt+1}/{max_retries}): {symbol}, 错误: {e}")
                 if attempt < max_retries - 1:
                     wait_time = (attempt + 1) * 1  # 1, 2, 3 秒
                     logger.info(f"等待 {wait_time} 秒后重试...")
                     time.sleep(wait_time)
                 else:
-                    logger.error(f"获取 {symbol} 数据最终失败")
+                    if self._is_empty_data_error(e):
+                        logger.debug(f"获取 {symbol} 数据最终为空")
+                    else:
+                        logger.error(f"获取 {symbol} 数据最终失败")
                     raise
     
     def get_stock_data(self, symbol: str, start_date: str, end_date: str,
@@ -390,7 +414,17 @@ class TushareStockDataManager:
                 missing_end = (first_existing - pd.Timedelta(days=1)).strftime("%Y%m%d")
                 logger.debug(f"需要补充早期数据: {missing_start} 至 {missing_end}")
                 try:
-                    df_early = self._fetch_from_tushare(symbol, missing_start, missing_end, adjust=adjust)
+                    if pd.to_datetime(missing_start) > pd.to_datetime(missing_end):
+                        df_early = pd.DataFrame()
+                    else:
+                        # 补数据阶段快速失败，避免长时间重试阻塞批处理。
+                        df_early = self._fetch_from_tushare(
+                            symbol,
+                            missing_start,
+                            missing_end,
+                            adjust=adjust,
+                            max_retries=1,
+                        )
                     if not df_early.empty:
                         df_existing = pd.concat([df_early, df_existing])
                         df_existing = df_existing[~df_existing.index.duplicated(keep='last')]
@@ -398,7 +432,10 @@ class TushareStockDataManager:
                         need_save = True
                         logger.debug(f"早期数据补充完成: 新增 {len(df_early)} 条")
                 except Exception as e:
-                    logger.warning(f"补充早期数据失败: {e}，继续使用现有数据")
+                    if self._is_empty_data_error(e):
+                        logger.debug(f"补充早期数据为空: {symbol}，继续使用现有数据")
+                    else:
+                        logger.warning(f"补充早期数据失败: {e}，继续使用现有数据")
 
             # 5. 检查是否需要补充最新数据（end_date 晚于现有数据的最晚日期）
             if last_existing < target_end:
@@ -406,7 +443,17 @@ class TushareStockDataManager:
                 missing_end = target_end.strftime("%Y%m%d")
                 logger.debug(f"需要补充最新数据: {missing_start} 至 {missing_end}")
                 try:
-                    df_late = self._fetch_from_tushare(symbol, missing_start, missing_end, adjust=adjust)
+                    if pd.to_datetime(missing_start) > pd.to_datetime(missing_end):
+                        df_late = pd.DataFrame()
+                    else:
+                        # 补数据阶段快速失败，避免对空窗口做 3 次重试。
+                        df_late = self._fetch_from_tushare(
+                            symbol,
+                            missing_start,
+                            missing_end,
+                            adjust=adjust,
+                            max_retries=1,
+                        )
                     if not df_late.empty:
                         df_existing = pd.concat([df_existing, df_late])
                         df_existing = df_existing[~df_existing.index.duplicated(keep='last')]
@@ -414,7 +461,10 @@ class TushareStockDataManager:
                         need_save = True
                         logger.debug(f"最新数据补充完成: 新增 {len(df_late)} 条")
                 except Exception as e:
-                    logger.warning(f"补充最新数据失败: {e}，返回现有数据范围")
+                    if self._is_empty_data_error(e):
+                        logger.debug(f"补充最新数据为空: {symbol}，返回现有数据范围")
+                    else:
+                        logger.warning(f"补充最新数据失败: {e}，返回现有数据范围")
 
             # 6. 如有补充，保存更新后的数据
             if need_save:

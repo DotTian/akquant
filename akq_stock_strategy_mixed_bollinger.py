@@ -3,7 +3,7 @@
 
 策略要点：
 1. 股票池来源：StockSelector 基本面筛选结果。
-2. 买入信号：布林买入信号 + ADX 趋势确认同时成立。
+2. 买入信号：近 N 日触下轨后回到下轨上方即可买入；若同时满足 ADX 趋势确认，则优先级更高。
 3. 仓位控制：总计 10 个仓位，每仓 10%，单行业最多 3 只。
 4. 同行业候选超限时，按 strength = boll_deviation * adx_value 由强到弱优先。
 5. 风控退出：
@@ -42,8 +42,10 @@ class MixedBollingerStrategy(Strategy):
         max_positions_per_industry: int = 3,
         boll_period: int = 20,
         boll_std: float = 2.0,
+        boll_rebound_lookback: int = 3,
         adx_period: int = 14,
-        adx_threshold: float = 20.0,
+        adx_threshold: float = 15.0,
+        weekly_gate_weeks: int = 2,
         stop_loss_pct: float = -0.07,
         trailing_start_pct: float = 0.10,
         trailing_drawdown_pct: float = 0.30,
@@ -59,8 +61,12 @@ class MixedBollingerStrategy(Strategy):
             raise ValueError("max_positions_per_industry 必须 >= 1")
         if boll_period < 2:
             raise ValueError("boll_period 必须 >= 2")
+        if boll_rebound_lookback < 1:
+            raise ValueError("boll_rebound_lookback 必须 >= 1")
         if adx_period < 2:
             raise ValueError("adx_period 必须 >= 2")
+        if weekly_gate_weeks < 1:
+            raise ValueError("weekly_gate_weeks 必须 >= 1")
 
         self.symbols = sorted({str(s).strip() for s in symbols if str(s).strip()})
         self.industry_by_symbol = industry_by_symbol or {}
@@ -71,8 +77,10 @@ class MixedBollingerStrategy(Strategy):
 
         self.boll_period = int(boll_period)
         self.boll_std = float(boll_std)
+        self.boll_rebound_lookback = int(boll_rebound_lookback)
         self.adx_period = int(adx_period)
         self.adx_threshold = float(adx_threshold)
+        self.weekly_gate_weeks = int(weekly_gate_weeks)
 
         self.stop_loss_pct = float(stop_loss_pct)
         self.trailing_start_pct = float(trailing_start_pct)
@@ -82,7 +90,10 @@ class MixedBollingerStrategy(Strategy):
         self.peak_pnl: dict[str, float] = {}
         self.entry_strength: dict[str, float] = {}
 
-        history_need = max(self.boll_period + 2, self.adx_period * 2 + 2)
+        history_need = max(
+            self.boll_period + self.boll_rebound_lookback + 2,
+            self.adx_period * 2 + 2,
+        )
         self.set_history_depth(history_need)
 
     def on_start(self) -> None:
@@ -109,6 +120,17 @@ class MixedBollingerStrategy(Strategy):
             return self._week_key_from_date(pd.Timestamp.today())
         day = pd.to_datetime(int(ts), unit="ns", utc=True).tz_convert("Asia/Shanghai").normalize()
         return self._week_key_from_date(day)
+
+    def _get_allowed_symbols(self, week_key: str) -> Optional[set[str]]:
+        if self.weekly_universe is None:
+            return None
+
+        allowed: set[str] = set()
+        base_day = pd.to_datetime(week_key)
+        for i in range(self.weekly_gate_weeks):
+            wk = (base_day - pd.Timedelta(days=7 * i)).strftime("%Y-%m-%d")
+            allowed.update(self.weekly_universe.get(wk, set()))
+        return allowed
 
     def _calc_adx_parts(
         self,
@@ -178,11 +200,12 @@ class MixedBollingerStrategy(Strategy):
         prev_close = float(closes.iloc[-2])
         curr_close = float(closes.iloc[-1])
         prev_upper = float(upper.iloc[-2])
-        prev_lower = float(lower.iloc[-2])
         curr_upper = float(upper.iloc[-1])
         curr_lower = float(lower.iloc[-1])
 
-        boll_buy = prev_close <= prev_lower and curr_close > curr_lower
+        rebound_slice = slice(-(self.boll_rebound_lookback + 1), -1)
+        recent_touch_lower = bool((closes.iloc[rebound_slice] <= lower.iloc[rebound_slice]).any())
+        boll_buy = recent_touch_lower and curr_close > curr_lower
         boll_sell = prev_close >= prev_upper and curr_close < curr_upper
 
         adx_val, plus_di, minus_di = self._calc_adx_parts(highs, lows, closes)
@@ -206,6 +229,7 @@ class MixedBollingerStrategy(Strategy):
             "adx_ok": bool(adx_ok),
             "adx": float(adx_val) if np.isfinite(adx_val) else 0.0,
             "strength": float(strength),
+            "resonance": bool(boll_buy and adx_ok),
         }
 
     def _reset_symbol_state(self, symbol: str) -> None:
@@ -271,9 +295,7 @@ class MixedBollingerStrategy(Strategy):
             return
 
         week_key = self._get_bar_week_key(bar)
-        allowed_this_week = None
-        if self.weekly_universe is not None:
-            allowed_this_week = self.weekly_universe.get(week_key, set())
+        allowed_symbols = self._get_allowed_symbols(week_key)
 
         features = self._signal_features(symbol, bar)
         if features is None:
@@ -309,14 +331,13 @@ class MixedBollingerStrategy(Strategy):
 
             return
 
-        if (
-            bool(features["boll_buy"])
-            and bool(features["adx_ok"])
-            and (allowed_this_week is None or symbol in allowed_this_week)
-        ):
+        if bool(features["boll_buy"]) and (allowed_symbols is None or symbol in allowed_symbols):
+            # 共振信号在仓位冲突时优先：给强度一个固定加成。
+            base_strength = float(features["strength"])
+            priority_boost = 1.0 if bool(features.get("resonance", False)) else 0.0
             self._try_open_with_constraints(
                 symbol=symbol,
-                strength=float(features["strength"]),
+                strength=base_strength + priority_boost,
                 price=price,
             )
 
@@ -483,7 +504,7 @@ def main() -> None:
     if not token:
         raise RuntimeError("请先设置环境变量 TUSHARE_TOKEN")
 
-    start_date = "20260101"
+    start_date = "20220101"
     end_date = "20260727"
     data_dir = "tsdata"
 
@@ -517,8 +538,10 @@ def main() -> None:
         max_positions_per_industry=3,
         boll_period=20,
         boll_std=2.0,
+        boll_rebound_lookback=3,
         adx_period=14,
-        adx_threshold=20.0,
+        adx_threshold=15.0,
+        weekly_gate_weeks=2,
         stop_loss_pct=-0.07,
         trailing_start_pct=0.10,
         trailing_drawdown_pct=0.30,

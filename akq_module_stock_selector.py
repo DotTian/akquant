@@ -474,9 +474,9 @@ class StockSelector:
         if symbol in self._kline_no_data_symbols and (df is None or df.empty):
             return None, None
 
-        # 若内存缓存未覆盖目标区间，则一次性拉到当前日期，后续月份复用同一份日线。
+        # 若内存缓存未覆盖目标区间，则仅拉到 trade_date，避免无意义补“今天”导致空数据重试。
         if df is None or df.empty or df.index.min() > start_dt or df.index.max() < end_dt:
-            cache_end = datetime.now().strftime('%Y%m%d')
+            cache_end = end
             try:
                 df = self.dm.get_stock_data(
                     symbol=symbol,
@@ -494,6 +494,8 @@ class StockSelector:
                 self._kline_no_data_symbols.discard(symbol)
             except Exception as e:
                 logger.debug(f'{symbol} 日线获取失败: {e}')
+                if ('空数据' in str(e)) or ('empty' in str(e).lower()):
+                    self._kline_no_data_symbols.add(symbol)
                 return None, None
 
         if df is None or df.empty:
