@@ -1,19 +1,17 @@
 """
-医药行业选股策略模块
+五行业选股策略模块
 
-选股条件（12条）：
-  1. 行业筛选（医药相关行业，参数化，可组合多个或单个行业）
-  2. 毛利率 > 行业均值 + 20%
-  3. 近3年毛利率趋势斜率 > 0（线性回归）
-  4. 研发费用 / 营收 >= 5%
-  5. 排除上一年年报净利润为负
-  6. 排除 ST / 退市
-  7. 排除 全体股东质押 > 50% 或 商誉/净资产 > 30%
-  8. 过去60个交易日平均日成交额 > 5000万
-  9. 排除 60日平均振幅 < 1%
- 10. 市值 20亿 ~ 300亿
- 11. PE_TTM < 自身历史 80% 分位
- 12. PEG 在 0.3 ~ 1.2 之间
+选股条件（10条）：
+    1. 行业筛选（五行业配置 + 电池关键词补充）
+    2. 毛利率 > 行业均值 + 20%
+    3. 近3年毛利率趋势斜率 > 0（线性回归）
+    4. 排除上一年年报净利润为负
+    5. 排除 ST / 退市
+    6. 排除 全体股东质押 > 50% 或 商誉/净资产 > 30%
+    7. 过去60个交易日平均日成交额 > 5000万
+    8. 排除 60日平均振幅 < 1%
+    9. 市值 20亿 ~ 500亿
+ 10. PE_TTM < 自身历史 80% 分位
 
 用法:
     from akq_module_stock_selector import StockSelector
@@ -46,10 +44,22 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# 默认医药相关行业列表（可通过 discover_industries() 动态发现后确认）
+# 五行业配置（来源于外部脚本口径）
 # ============================================================================
-DEFAULT_MEDICAL_INDUSTRIES = [
-    '医疗保健', '化学制药', '生物制药', '医药商业',
+FIVE_INDUSTRY_GROUPS: Dict[str, List[str]] = {
+    '医疗/医药': ['医疗保健', '化学制药', '生物制药', '中成药', '医药商业'],
+    '半导体': ['半导体'],
+    '电池(锂电)': ['电气设备', '汽车配件', '化工原料', '小金属', '汽车整车'],
+    '有色金属': ['小金属', '工业金属', '贵金属', '能源金属', '铝', '铜', '铅锌', '黄金'],
+    '化工': ['化工制品', '化工原料', '塑料', '化纤', '日用化工', '橡胶', '化工机械', '农药化肥'],
+}
+
+BATTERY_KEYWORDS = [
+    '电池', '锂', '宁德', '比亚迪', '恩捷', '天赐', '璞泰来',
+    '新宙邦', '当升', '容百', '华友', '寒锐', '科达利',
+    '星源材质', '德方纳米', '富临精工', '杉杉', '中材科技',
+    '天奈', '嘉元', '诺德', '振华新材', '长远锂科', '格林美',
+    '赣锋锂业', '天齐锂业', '融捷', '盛新', '永兴', '江特',
 ]
 
 
@@ -62,7 +72,7 @@ class StockSelector:
     token : str
         Tushare Pro Token
     industries : List[str] or None
-        目标行业列表，None 则使用默认医药行业
+        目标行业列表；None 则使用五行业默认配置
     data_dir : str
         缓存数据根目录
     request_interval : float
@@ -75,9 +85,17 @@ class StockSelector:
         industries: Optional[List[str]] = None,
         data_dir: str = 'selector_data',
         request_interval: float = 0.05,
+        industry_groups: Optional[Dict[str, List[str]]] = None,
+        battery_keywords: Optional[List[str]] = None,
     ):
         self.token = token
-        self.industries = industries or DEFAULT_MEDICAL_INDUSTRIES
+        self.industry_groups = industry_groups or FIVE_INDUSTRY_GROUPS
+        self.battery_keywords = battery_keywords or BATTERY_KEYWORDS
+        self.industries = industries or sorted(
+            {
+                ind for ind_list in self.industry_groups.values() for ind in ind_list
+            }
+        )
         self.request_interval = request_interval
         self._last_req = 0
 
@@ -121,6 +139,18 @@ class StockSelector:
         logger.info(
             f'StockSelector 初始化完成，目标行业: {len(self.industries)} 个'
         )
+
+    def _apply_industry_filter(self, candidates: pd.DataFrame) -> pd.DataFrame:
+        """五行业筛选：行业匹配 + 电池关键词补充。"""
+        if candidates.empty:
+            return candidates
+
+        industry_set = set(self.industries)
+        industry_mask = candidates['industry'].isin(industry_set)
+        keyword_mask = candidates['name'].astype(str).apply(
+            lambda n: any(k in n for k in self.battery_keywords)
+        )
+        return candidates[industry_mask | keyword_mask].copy()
 
     # ========================================================================
     # 工具方法
@@ -614,11 +644,9 @@ class StockSelector:
         candidates = candidates[['symbol', 'name', 'industry', 'list_date']].copy()
         candidates['symbol'] = candidates['symbol'].astype(str).str.zfill(6)
 
-        # ── Step 1: 行业筛选 ──
+        # ── Step 1: 行业筛选（五行业 + 电池关键词） ──
         before = len(candidates)
-        candidates = candidates[
-            candidates['industry'].isin(self.industries)
-        ].copy()
+        candidates = self._apply_industry_filter(candidates)
         if verbose:
             print(f'[1] 行业筛选 → {before} → {len(candidates)} (过滤 {before - len(candidates)})')
 
@@ -658,7 +686,7 @@ class StockSelector:
                 print(f'  加载 daily_basic: {i+1}/{len(candidates)}')
             db_data[sym] = self._get_daily_basic(sym)
 
-        # ── Step 10: 市值 20-300 亿 ──
+        # ── Step 10: 市值 20-500 亿 ──
         mkt_caps = {}
         for sym in candidates['symbol']:
             df = db_data.get(sym)
@@ -680,10 +708,10 @@ class StockSelector:
         candidates = candidates[
             candidates['market_cap'].notna()
             & (candidates['market_cap'] >= 20)
-            & (candidates['market_cap'] <= 300)
+            & (candidates['market_cap'] <= 500)
         ].copy()
         if verbose:
-            print(f'[3] 市值 20-300亿 → {before} → {len(candidates)}')
+            print(f'[3] 市值 20-500亿 → {before} → {len(candidates)}')
 
         if candidates.empty:
             return pd.DataFrame()
@@ -769,11 +797,8 @@ class StockSelector:
         if candidates.empty:
             return pd.DataFrame()
 
-        # ── 获取毛利率、研发占比等基本面指标 ──
-        # 注意：不使用 get_all_metrics，因为其内部的 calculate_peg 会直接调 daily_basic API，
-        # 绕过 _get_daily_basic 缓存。这里直接从已缓存的 fina_indicator/income 中提取。
+        # ── 获取毛利率等基本面指标 ──
         gross_margins = {}
-        rd_ratios = {}
         gm_slopes = {}
         for i, sym in enumerate(candidates['symbol']):
             if verbose and (i % 10 == 0):
@@ -785,23 +810,10 @@ class StockSelector:
                 gross_margins[sym] = float(latest_f['grossprofit_margin']) if pd.notna(latest_f.get('grossprofit_margin')) else None
             else:
                 gross_margins[sym] = None
-            # 研发占比（rd_exp / total_revenue）
-            df_income = self.fm.get_income(sym)
-            if df_income is not None and not df_income.empty:
-                latest_i = df_income.sort_values('end_date', ascending=False).iloc[0]
-                rev = latest_i.get('total_revenue')
-                rd = latest_i.get('rd_exp')
-                if rev and rd and rev > 0:
-                    rd_ratios[sym] = round(float(rd) / float(rev) * 100, 2)
-                else:
-                    rd_ratios[sym] = None
-            else:
-                rd_ratios[sym] = None
             # 毛利率 3 年趋势
             gm_slopes[sym] = self.calc_gross_margin_slope(sym, years=3)
 
         candidates['gross_margin'] = candidates['symbol'].map(gross_margins)
-        candidates['rd_ratio'] = candidates['symbol'].map(rd_ratios)
         candidates['gm_slope'] = candidates['symbol'].map(gm_slopes)
 
         # ── Step 2: 毛利率 > 行业均值 + 20% ──
@@ -837,17 +849,6 @@ class StockSelector:
         ].copy()
         if verbose:
             print(f'[10] 3年毛利率趋势>0 → {before} → {len(candidates)}')
-
-        if candidates.empty:
-            return pd.DataFrame()
-
-        # ── Step 4: 研发占比 ≥ 5% ──
-        before = len(candidates)
-        candidates = candidates[
-            candidates['rd_ratio'].notna() & (candidates['rd_ratio'] >= 5)
-        ].copy()
-        if verbose:
-            print(f'[11] 研发占比≥5% → {before} → {len(candidates)}')
 
         if candidates.empty:
             return pd.DataFrame()
@@ -888,36 +889,12 @@ class StockSelector:
             & (candidates['pe_ttm'] < candidates['pe_80th'])
         ].copy()
         if verbose:
-            print(f'[12] PE<80%分位 → {before} → {len(candidates)}')
-
-        if candidates.empty:
-            return pd.DataFrame()
-
-        # ── Step 12: PEG 0.3 ~ 1.2 ──
-        peg_dict = {}
-        growth_dict = {}
-        for i, sym in enumerate(candidates['symbol']):
-            if verbose and (i % 10 == 0):
-                print(f'  计算 PEG: {i+1}/{len(candidates)}')
-            peg, growth = self._calculate_peg(sym, pe_current.get(sym))
-            peg_dict[sym] = peg
-            growth_dict[sym] = growth
-        candidates['peg'] = candidates['symbol'].map(peg_dict)
-        candidates['profit_growth'] = candidates['symbol'].map(growth_dict)
-        before = len(candidates)
-        candidates = candidates[
-            candidates['peg'].notna()
-            & (candidates['peg'] >= 0.3)
-            & (candidates['peg'] <= 1.2)
-        ].copy()
-        if verbose:
-            print(f'[13] PEG 0.3~1.2 → {before} → {len(candidates)}')
+            print(f'[11] PE<80%分位 → {before} → {len(candidates)}')
 
         # ── 整理输出列 ──
         out_cols = [
             'symbol', 'name', 'industry',
             'gross_margin', 'industry_avg_gm', 'gm_slope',
-            'rd_ratio', 'peg', 'profit_growth',
             'pe_ttm', 'pe_80th', 'market_cap',
             'avg_amount_60d', 'avg_amplitude_60d',
             'pledge_ratio', 'goodwill_ratio',
@@ -991,12 +968,12 @@ class StockSelector:
         -------
         int : 预加载的股票数量
         """
-        target_industries = sectors or self.industries
         all_stocks = self.sim.get_all_stocks_info(force_update=False)
         candidates = all_stocks.reset_index()
-        candidates = candidates[
-            candidates['industry'].isin(target_industries)
-        ]
+        if sectors is not None:
+            candidates = candidates[candidates['industry'].isin(sectors)]
+        else:
+            candidates = self._apply_industry_filter(candidates)
         symbols = (
             candidates['symbol']
             .astype(str)
@@ -1055,8 +1032,8 @@ class StockSelector:
             _ = self.fm.get_fina_indicator(sym)
         print(f'    {total}/{total} (100%) 完成')
 
-        # 6. 利润表（营收/研发/净利润）
-        print('  [6/7] 预加载 利润表（营收/研发/净利润）...')
+        # 6. 利润表（净利润）
+        print('  [6/7] 预加载 利润表（净利润）...')
         for idx, sym in enumerate(symbols):
             if idx % 20 == 0:
                 print(f'    {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
@@ -1235,7 +1212,7 @@ if __name__ == '__main__':
     # print(f'\n共发现 {len(industry_df)} 个相关行业')
     # print('请确认上述行业后，将其作为 industries 参数传入 StockSelector')
     # print('当前默认行业:')
-    # for ind in DEFAULT_MEDICAL_INDUSTRIES:
+    # for ind in sorted({x for v in FIVE_INDUSTRY_GROUPS.values() for x in v}):
     #     print(f'  - {ind}')
 
     # ====== Step B: 月度回测选股 ======
@@ -1245,7 +1222,7 @@ if __name__ == '__main__':
 
     sel = StockSelector(
         token=token,
-        # industries=DEFAULT_MEDICAL_INDUSTRIES,
+        # industries=sorted({x for v in FIVE_INDUSTRY_GROUPS.values() for x in v}),
         #industries=['医疗保健', '化学制药', '生物制药', '医药商业'],
         # 关注四个大行业，半导体，医药，金属，化工
         industries=['半导体', '元器件','医疗保健', '化学制药', '生物制药', '医药商业', '工业金属','小金属','贵金属','能源金属', '化学制品', '化学原料' ],
