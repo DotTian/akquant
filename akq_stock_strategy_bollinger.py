@@ -119,6 +119,34 @@ if __name__ == "__main__":
     )
     df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
     
+    # 额外获取基准数据（例如沪深300）
+    benchmark_symbol = "000300.SH"
+    print(f"正在获取 {benchmark_symbol} 基准数据...")
+    try:
+        benchmark_df = manager.get_stock_data(
+            symbol=benchmark_symbol,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except Exception as exc:
+        print(f"基准数据获取失败，使用主数据收益率作为兜底基准: {exc}")
+        benchmark_df = None
+
+    if benchmark_df is not None and not benchmark_df.empty:
+        benchmark_df.index = pd.to_datetime(benchmark_df.index)
+        benchmark_returns = (
+            benchmark_df["close"]
+            .pct_change()
+            .fillna(0.0)
+            .rename(benchmark_symbol)
+        )
+    else:
+        benchmark_returns = (
+            df["close"]
+            .pct_change()
+            .fillna(0.0)
+            .rename("fallback_benchmark")
+        )
     
     print(f"数据获取成功，共 {len(df)} 条记录")
     
@@ -163,7 +191,8 @@ if __name__ == "__main__":
         filename=report_path,
         title=f"布林线策略报告 ({symbol})",
         market_data=df,
-        include_trade_kline=True
+        include_trade_kline=True,
+        benchmark=benchmark_returns,
     )
     
     print(f"\n报告已保存至: {report_path}")

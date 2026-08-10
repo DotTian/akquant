@@ -148,9 +148,24 @@ class TushareStockDataManager:
     def _convert_symbol(self, symbol: str) -> str:
         """
         将股票代码转换为 Tushare 格式。
-        兼容输入：'688131'、'688131.SH'、'920017.BJ'。
+        兼容输入：'688131'、'688131.SH'、'920017.BJ'、'000300.SH'。
         """
-        code = self._normalize_symbol(symbol)
+        if symbol is None:
+            return ""
+
+        raw_symbol = str(symbol).strip().upper()
+        if "." in raw_symbol:
+            exchange = raw_symbol.split(".", 1)[1]
+            if exchange in {"SH", "SZ", "BJ"}:
+                return raw_symbol
+
+        code = self._normalize_symbol(raw_symbol)
+
+        # 指数/基准类代码保留常见交易所后缀，避免 000300.SH 被错误映射成 000300.SZ
+        if code in {"000001", "000300", "000688", "000905", "000016", "000036", "000050", "000061", "000063"}:
+            return f"{code}.SH"
+        if code in {"399001", "399005", "399006", "399300", "399905", "399550"}:
+            return f"{code}.SZ"
 
         # 北交所（43/83/87/88/92 开头）
         if code.startswith(('43', '83', '87', '88', '92')):
@@ -250,6 +265,17 @@ class TushareStockDataManager:
         
         return df
     
+    def _is_index_symbol(self, symbol: str) -> bool:
+        """判断是否为指数/基准类代码。"""
+        if symbol is None:
+            return False
+        code = self._normalize_symbol(str(symbol))
+        return code in {
+            '000001', '000300', '000688', '000905', '000016', '000036', '000050',
+            '000061', '000063', '399001', '399005', '399006', '399300', '399905',
+            '399550', '399001', '399006', '399300'
+        }
+
     def _fetch_from_tushare(self, symbol: str, start_date: str, end_date: str, 
                             adjust: str = 'qfq', max_retries: int = 3) -> pd.DataFrame:
         """
@@ -282,8 +308,20 @@ class TushareStockDataManager:
                 logger.debug(f"请求 Tushare: {ts_code}, {start_date} - {end_date}")
                 
                 # 根据复权类型选择不同的接口
-                if adjust == 'qfq':
-                    # 使用 pro_bar 接口获取前复权数据（推荐）
+                if self._is_index_symbol(symbol):
+                    params = dict(
+                        ts_code=ts_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                        freq='D',
+                        asset='I',
+                    )
+                    if adjust == 'qfq':
+                        params['adj'] = 'qfq'
+                    elif adjust == 'hfq':
+                        params['adj'] = 'hfq'
+                    df = ts.pro_bar(**params)
+                elif adjust == 'qfq':
                     df = ts.pro_bar(
                         ts_code=ts_code,
                         start_date=start_date,
