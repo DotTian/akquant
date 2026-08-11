@@ -162,7 +162,7 @@ class TushareStockDataManager:
         code = self._normalize_symbol(raw_symbol)
 
         # 指数/基准类代码保留常见交易所后缀，避免 000300.SH 被错误映射成 000300.SZ
-        if code in {"000001", "000300", "000688", "000905", "000016", "000036", "000050", "000061", "000063"}:
+        if code in {"000001", "000300", "000680", "000688", "000905", "000016", "000036", "000050", "000061", "000063"}:
             return f"{code}.SH"
         if code in {"399001", "399005", "399006", "399300", "399905", "399550"}:
             return f"{code}.SZ"
@@ -269,11 +269,15 @@ class TushareStockDataManager:
         """判断是否为指数/基准类代码。"""
         if symbol is None:
             return False
-        code = self._normalize_symbol(str(symbol))
+        raw = str(symbol).strip().upper()
+        code = self._normalize_symbol(raw)
+        # 上交所 000xxx 多为指数代码（如 000300.SH, 000680.SH）。
+        if raw.endswith('.SH') and code.startswith('000'):
+            return True
         return code in {
-            '000001', '000300', '000688', '000905', '000016', '000036', '000050',
+            '000001', '000300', '000680', '000688', '000905', '000016', '000036', '000050',
             '000061', '000063', '399001', '399005', '399006', '399300', '399905',
-            '399550', '399001', '399006', '399300'
+            '399550'
         }
 
     def _fetch_from_tushare(self, symbol: str, start_date: str, end_date: str, 
@@ -559,7 +563,8 @@ class TushareStockDataManager:
     
     def get_multiple_stocks(self, symbols: List[str], start_date: str, end_date: str,
                            force_update: bool = False, adjust: str = 'qfq',
-                           delay_between: float = 2.0) -> Dict[str, pd.DataFrame]:
+                           delay_between: float = 2.0,
+                           allow_api: bool = True) -> Dict[str, pd.DataFrame]:
         """
         批量获取多只股票数据
         
@@ -577,6 +582,8 @@ class TushareStockDataManager:
             复权类型
         delay_between : float
             每只股票之间的延迟（秒）
+        allow_api : bool
+            是否允许访问 Tushare。False 时仅使用本地缓存。
         
         Returns:
         --------
@@ -593,12 +600,13 @@ class TushareStockDataManager:
                     start_date=start_date,
                     end_date=end_date,
                     force_update=force_update,
-                    adjust=adjust
+                    adjust=adjust,
+                    allow_api=allow_api,
                 )
                 results[symbol] = df
                 
-                # 股票间延迟
-                if i < len(symbols) - 1:
+                # 仅在允许 API 时执行股票间延迟
+                if allow_api and i < len(symbols) - 1 and delay_between > 0:
                     logger.info(f"等待 {delay_between} 秒后继续...")
                     time.sleep(delay_between)
                     

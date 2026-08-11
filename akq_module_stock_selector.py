@@ -29,7 +29,7 @@ import time
 import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Set, Tuple
+from typing import Any, Optional, Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -61,6 +61,41 @@ BATTERY_KEYWORDS = [
     '天奈', '嘉元', '诺德', '振华新材', '长远锂科', '格林美',
     '赣锋锂业', '天齐锂业', '融捷', '盛新', '永兴', '江特',
 ]
+
+# 科创超跌价值回归筛选参数：默认值保持当前口径；可通过 overrides 或调用参数覆盖。
+STAR_VALUE_REVERSION_FILTER_DEFAULTS: Dict[str, Any] = {
+    'listing_days_min': 182,
+    'listing_days_max': 1095, #730 = 2year
+    'drawdown_from_post_list_high_max': -0.50,
+    'revenue_growth_since_list_min': 0.0,
+    'gross_margin_growth_since_list_min': 0.0,
+    'pledge_ratio_max': 50.0,
+    'goodwill_ratio_max': 30.0,
+    'debt_ratio_max': 70.0,
+    'amp_20d_max': 0.20, #0.20 振幅
+    'vol_ratio_20_60_max': 0.80, #缩量
+    'avg_turnover_60d_min': 1.0, #平均换手率
+    'enable_tech_filter': True, #技术面筛选开关
+}
+
+STAR_VALUE_REVERSION_FILTER_OVERRIDES: Dict[str, Any] = {}
+
+# mixed bollinger 对应的基础选股参数：默认值保持当前口径；支持统一覆盖。
+MIXED_BOLLINGER_FILTER_DEFAULTS: Dict[str, Any] = {
+    'market_cap_min': 20.0,
+    'market_cap_max': 500.0,
+    'turnover_window_days': 60,
+    'avg_amplitude_60d_min': 1.0,
+    'avg_amount_60d_min': 5000.0,
+    'pledge_ratio_max': 50.0,
+    'goodwill_ratio_max': 30.0,
+    'gross_margin_industry_premium': 20.0,
+    'gm_slope_min': 0.0,
+    'pe_history_percentile': 80.0,
+    'pe_history_min_samples': 20,
+}
+
+MIXED_BOLLINGER_FILTER_OVERRIDES: Dict[str, Any] = {}
 
 
 class StockSelector:
@@ -129,8 +164,10 @@ class StockSelector:
 
         # 内存缓存
         self._daily_basic_cache: Dict[str, pd.DataFrame] = {}
+        self._star_daily_basic_cache: Dict[str, pd.DataFrame] = {}
         self._pledge_cache: Dict[str, Optional[float]] = {}
         self._bs_cache: Dict[str, pd.DataFrame] = {}
+        self._star_bs_debt_cache: Dict[str, pd.DataFrame] = {}
         self._listing_status_cache: Dict[str, dict] = {}
         self._kline_cache: Dict[str, pd.DataFrame] = {}
         self._kline_no_data_symbols: Set[str] = set()
@@ -168,6 +205,11 @@ class StockSelector:
         code = cls._normalize_symbol(symbol)
         return code.startswith(('43', '83', '87', '88', '92'))
 
+    @classmethod
+    def _is_star_688_symbol(cls, symbol: object) -> bool:
+        code = cls._normalize_symbol(symbol)
+        return code.startswith('688')
+
     # ========================================================================
     # 工具方法
     # ========================================================================
@@ -191,6 +233,26 @@ class StockSelector:
             return f'{code}.SH'
         return f'{code}.SZ'
 
+    @staticmethod
+    def _resolve_star_value_reversion_filter_params(
+        filter_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        params = dict(STAR_VALUE_REVERSION_FILTER_DEFAULTS)
+        params.update({k: v for k, v in STAR_VALUE_REVERSION_FILTER_OVERRIDES.items() if v is not None})
+        if filter_params:
+            params.update({k: v for k, v in filter_params.items() if v is not None})
+        return params
+
+    @staticmethod
+    def _resolve_mixed_bollinger_filter_params(
+        filter_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        params = dict(MIXED_BOLLINGER_FILTER_DEFAULTS)
+        params.update({k: v for k, v in MIXED_BOLLINGER_FILTER_OVERRIDES.items() if v is not None})
+        if filter_params:
+            params.update({k: v for k, v in filter_params.items() if v is not None})
+        return params
+
     def _cache_path(self, key: str) -> Path:
         return self.cache_dir / f'{key}.parquet'
 
@@ -206,6 +268,274 @@ class StockSelector:
 
     def _save_pickle_cache(self, key: str, df: pd.DataFrame):
         df.to_parquet(self._cache_path(key), index=False)
+
+    def _get_star_daily_basic(self, symbol: str) -> Optional[pd.DataFrame]:
+        """获取科创策略专用 daily_basic（含换手率字段）。"""
+        if symbol in self._star_daily_basic_cache:
+            return self._star_daily_basic_cache[symbol]
+
+        ck = f'star_vr_daily_basic_{symbol}'
+        df = self._load_pickle_cache(ck)
+        if df is not None and not df.empty:
+            try:
+                df = df.copy()
+                if 'trade_date' in df.columns:
+                    df['trade_date'] = pd.to_datetime(df['trade_date'])
+                self._star_daily_basic_cache[symbol] = df
+                return df
+            except Exception:
+                pass
+
+        self._wait()
+        ts_code = self._to_ts_code(symbol)
+        try:
+            df = self.pro.daily_basic(
+                ts_code=ts_code,
+                start_date='20180101',
+                end_date=datetime.now().strftime('%Y%m%d'),
+                fields='ts_code,trade_date,pe_ttm,total_mv,turnover_rate,turnover_rate_f',
+            )
+            if df is not None and not df.empty:
+                df['trade_date'] = pd.to_datetime(df['trade_date'])
+                self._save_pickle_cache(ck, df)
+                self._star_daily_basic_cache[symbol] = df
+                return df
+        except Exception as e:
+            logger.warning(f'star daily_basic {symbol} 失败: {e}')
+        return None
+
+    def _get_balance_sheet_for_debt(self, symbol: str) -> Optional[pd.DataFrame]:
+        """获取资产负债率所需字段。"""
+        if symbol in self._star_bs_debt_cache:
+            return self._star_bs_debt_cache[symbol]
+
+        ck = f'star_vr_bs_debt_{symbol}'
+        cached = self._load_pickle_cache(ck)
+        if cached is not None and not cached.empty:
+            cached = cached.copy()
+            cached['end_date'] = pd.to_datetime(cached['end_date'])
+            self._star_bs_debt_cache[symbol] = cached
+            return cached
+
+        self._wait()
+        ts_code = self._to_ts_code(symbol)
+        try:
+            df = self.pro.balancesheet(
+                ts_code=ts_code,
+                start_date='20180101',
+                end_date=datetime.now().strftime('%Y%m%d'),
+                fields='ts_code,end_date,total_assets,total_liab',
+                report_type='1',
+            )
+            if df is not None and not df.empty:
+                df['end_date'] = pd.to_datetime(df['end_date'])
+                self._save_pickle_cache(ck, df)
+                self._star_bs_debt_cache[symbol] = df
+                return df
+        except Exception as e:
+            logger.warning(f'star balancesheet debt {symbol} 失败: {e}')
+        return None
+
+    def _calc_listing_days(self, list_date: object, trade_date: str) -> Optional[int]:
+        if list_date is None or pd.isna(list_date):
+            return None
+        try:
+            ld = pd.to_datetime(list_date)
+            td = pd.to_datetime(trade_date.replace('-', ''))
+            return int((td - ld).days)
+        except Exception:
+            return None
+
+    def _calc_post_list_drawdown(self, symbol: str, trade_date: str, list_date: object) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        """返回 (drawdown, latest_close, post_list_high)。"""
+        if list_date is None or pd.isna(list_date):
+            return None, None, None
+
+        start = pd.to_datetime(list_date).strftime('%Y%m%d')
+        end = trade_date.replace('-', '')
+        df = self._get_star_kline(symbol=symbol, start_date=start, end_date=end)
+
+        if df is None or df.empty or 'close' not in df.columns:
+            return None, None, None
+
+        k = df.sort_index().copy()
+        latest_close = float(k['close'].iloc[-1])
+        post_list_high = float(k['close'].max())
+        if post_list_high <= 0:
+            return None, latest_close, None
+        drawdown = (latest_close - post_list_high) / post_list_high
+        return float(drawdown), latest_close, post_list_high
+
+    def _calc_star_tech_metrics(self, symbol: str, trade_date: str) -> dict:
+        """计算科创策略技术过滤指标。"""
+        result: dict[str, Optional[float]] = {
+            'amp_20d': None,
+            'avg_vol_20d': None,
+            'avg_vol_60d': None,
+            'vol_ratio_20_60': None,
+            'avg_turnover_60d': None,
+        }
+
+        end = trade_date.replace('-', '')
+        start = (pd.to_datetime(end) - timedelta(days=220)).strftime('%Y%m%d')
+        df = self._get_star_kline(symbol=symbol, start_date=start, end_date=end)
+
+        if df is None or df.empty:
+            return result
+
+        k = df.sort_index().copy()
+        tail20 = k.tail(20)
+        tail60 = k.tail(60)
+        if len(tail20) >= 20 and 'close' in tail20.columns:
+            c_min = float(tail20['close'].min())
+            c_max = float(tail20['close'].max())
+            if c_min > 0:
+                result['amp_20d'] = (c_max - c_min) / c_min
+
+        if len(tail20) >= 20 and 'volume' in tail20.columns:
+            result['avg_vol_20d'] = float(tail20['volume'].mean())
+        if len(tail60) >= 60 and 'volume' in tail60.columns:
+            result['avg_vol_60d'] = float(tail60['volume'].mean())
+
+        avg20 = result.get('avg_vol_20d')
+        avg60 = result.get('avg_vol_60d')
+        if avg20 is not None and avg60 is not None and avg60 > 0:
+            result['vol_ratio_20_60'] = float(avg20 / avg60)
+
+        db = self._get_star_daily_basic(symbol)
+        if db is None or db.empty:
+            return result
+
+        td = pd.to_datetime(end)
+        d = db[db['trade_date'] <= td].sort_values('trade_date').copy()
+        if d.empty:
+            return result
+
+        turn_col = 'turnover_rate_f' if 'turnover_rate_f' in d.columns else 'turnover_rate'
+        if turn_col in d.columns:
+            t60 = d.tail(60)[turn_col].dropna()
+            if len(t60) >= 30:
+                result['avg_turnover_60d'] = float(t60.mean())
+
+        return result
+
+    def _get_star_kline(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """统一获取科创策略所需日线，优先内存缓存，再读本地/按需增量。"""
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        cached = self._kline_cache.get(symbol)
+        if cached is not None and not cached.empty:
+            c = cached.sort_index()
+            if c.index.min() <= start_dt and c.index.max() >= end_dt:
+                return c[(c.index >= start_dt) & (c.index <= end_dt)]
+
+        try:
+            df = self.dm.get_stock_data(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                adjust='qfq',
+                allow_api=not self._daily_data_local_only,
+            )
+        except Exception:
+            return None
+
+        if df is None or df.empty:
+            return None
+
+        self._kline_cache[symbol] = df
+        k = df.sort_index()
+        return k[(k.index >= start_dt) & (k.index <= end_dt)]
+
+    def _calc_debt_ratio(self, symbol: str, trade_date: str) -> Optional[float]:
+        """资产负债率 (%)."""
+        df = self._get_balance_sheet_for_debt(symbol)
+        if df is None or df.empty:
+            return None
+        td = pd.to_datetime(trade_date.replace('-', ''))
+        d = df[df['end_date'] <= td].sort_values('end_date')
+        if d.empty:
+            return None
+        last = d.iloc[-1]
+        ta = last.get('total_assets')
+        tl = last.get('total_liab')
+        if ta is None or tl is None or pd.isna(ta) or pd.isna(tl) or float(ta) <= 0:
+            return None
+        return round(float(tl) / float(ta) * 100.0, 2)
+
+    def _calc_rd_to_revenue_ratio(self, symbol: str, trade_date: str) -> Optional[float]:
+        """研发费用/营收占比 (%), 提示项。"""
+        df = self.fm.get_income(symbol)
+        if df is None or df.empty:
+            return None
+        td = pd.to_datetime(trade_date.replace('-', ''))
+        d = df[df['end_date'] <= td].sort_values('end_date')
+        if d.empty:
+            return None
+        latest = d.iloc[-1]
+        rev = latest.get('total_revenue')
+        rd = latest.get('rd_exp')
+        if rev is None or rd is None or pd.isna(rev) or pd.isna(rd) or float(rev) <= 0:
+            return None
+        return round(float(rd) / float(rev) * 100.0, 2)
+
+    def _calc_growth_since_listing(self, symbol: str, trade_date: str, list_date: object) -> tuple[Optional[float], Optional[float]]:
+        """返回 (营收增长率%, 毛利率增量百分点)."""
+        if list_date is None or pd.isna(list_date):
+            return None, None
+
+        td = pd.to_datetime(trade_date.replace('-', ''))
+        ld = pd.to_datetime(list_date)
+
+        income = self.fm.get_income(symbol)
+        if income is None or income.empty:
+            return None, None
+        annual_income = income[
+            (income['end_date'].dt.month == 12)
+            & (income['end_date'].dt.day == 31)
+            & (income['end_date'] <= td)
+        ].sort_values('end_date')
+        if annual_income.empty:
+            return None, None
+
+        first_income = annual_income[annual_income['end_date'] >= ld]
+        if first_income.empty:
+            return None, None
+        first_income_row = first_income.iloc[0]
+        latest_income_row = annual_income.iloc[-1]
+
+        first_rev = first_income_row.get('total_revenue')
+        latest_rev = latest_income_row.get('total_revenue')
+        revenue_growth = None
+        if (
+            first_rev is not None and latest_rev is not None
+            and pd.notna(first_rev) and pd.notna(latest_rev)
+            and float(first_rev) > 0
+        ):
+            revenue_growth = (float(latest_rev) - float(first_rev)) / float(first_rev) * 100.0
+
+        fina = self.fm.get_fina_indicator(symbol)
+        if fina is None or fina.empty:
+            return revenue_growth, None
+        annual_fina = fina[
+            (fina['end_date'].dt.month == 12)
+            & (fina['end_date'].dt.day == 31)
+            & (fina['end_date'] <= td)
+        ].sort_values('end_date')
+        if annual_fina.empty:
+            return revenue_growth, None
+
+        first_fina = annual_fina[annual_fina['end_date'] >= ld]
+        if first_fina.empty:
+            return revenue_growth, None
+        first_gm = first_fina.iloc[0].get('grossprofit_margin')
+        latest_gm = annual_fina.iloc[-1].get('grossprofit_margin')
+        gm_growth = None
+        if first_gm is not None and latest_gm is not None and pd.notna(first_gm) and pd.notna(latest_gm):
+            gm_growth = float(latest_gm) - float(first_gm)
+
+        return revenue_growth, gm_growth
 
     def _build_turnover_amplitude_series(self, symbol: str, n_days: int = 60) -> Optional[pd.DataFrame]:
         """基于单票日线一次性预计算滚动 60 日成交额/振幅特征序列。"""
@@ -804,7 +1134,12 @@ class StockSelector:
     # ========================================================================
     # 主筛选方法
     # ========================================================================
-    def select(self, trade_date: str, verbose: bool = True) -> pd.DataFrame:
+    def select(
+        self,
+        trade_date: str,
+        verbose: bool = True,
+        filter_params: Optional[Dict[str, Any]] = None,
+    ) -> pd.DataFrame:
         """
         按全部条件筛选股票。
 
@@ -821,6 +1156,19 @@ class StockSelector:
         """
         trade_date = trade_date.replace('-', '')
         t0 = time.time()
+        params = self._resolve_mixed_bollinger_filter_params(filter_params)
+
+        market_cap_min = float(params['market_cap_min'])
+        market_cap_max = float(params['market_cap_max'])
+        turnover_window_days = int(params['turnover_window_days'])
+        avg_amplitude_60d_min = float(params['avg_amplitude_60d_min'])
+        avg_amount_60d_min = float(params['avg_amount_60d_min'])
+        pledge_ratio_max = float(params['pledge_ratio_max'])
+        goodwill_ratio_max = float(params['goodwill_ratio_max'])
+        gross_margin_industry_premium = float(params['gross_margin_industry_premium'])
+        gm_slope_min = float(params['gm_slope_min'])
+        pe_history_percentile = float(params['pe_history_percentile'])
+        pe_history_min_samples = int(params['pe_history_min_samples'])
 
         if verbose:
             print(f'\n{"="*70}')
@@ -901,8 +1249,8 @@ class StockSelector:
         before = len(candidates)
         candidates = candidates[
             candidates['market_cap'].notna()
-            & (candidates['market_cap'] >= 20)
-            & (candidates['market_cap'] <= 500)
+            & (candidates['market_cap'] >= market_cap_min)
+            & (candidates['market_cap'] <= market_cap_max)
         ].copy()
         if verbose:
             print(f'[3] 市值 20-500亿 → {before} → {len(candidates)}')
@@ -916,7 +1264,7 @@ class StockSelector:
         for i, sym in enumerate(candidates['symbol']):
             if verbose and (i % 20 == 0):
                 print(f'  计算成交额/振幅: {i+1}/{len(candidates)}')
-            amt, amp = self._calc_turnover_amplitude(sym, trade_date, n_days=60)
+            amt, amp = self._calc_turnover_amplitude(sym, trade_date, n_days=turnover_window_days)
             amt_dict[sym] = amt
             amp_dict[sym] = amp
         candidates['avg_amount_60d'] = candidates['symbol'].map(amt_dict)
@@ -926,7 +1274,7 @@ class StockSelector:
         before = len(candidates)
         candidates = candidates[
             candidates['avg_amplitude_60d'].notna()
-            & (candidates['avg_amplitude_60d'] >= 1.0)
+            & (candidates['avg_amplitude_60d'] >= avg_amplitude_60d_min)
         ].copy()
         if verbose:
             print(f'[4] 排除 60日均振幅<1% → {before} → {len(candidates)}')
@@ -935,7 +1283,7 @@ class StockSelector:
         before = len(candidates)
         candidates = candidates[
             candidates['avg_amount_60d'].notna()
-            & (candidates['avg_amount_60d'] > 5000)
+            & (candidates['avg_amount_60d'] > avg_amount_60d_min)
         ].copy()
         if verbose:
             print(f'[5] 60日均成交额>5000万 → {before} → {len(candidates)}')
@@ -965,7 +1313,7 @@ class StockSelector:
         before = len(candidates)
         candidates = candidates[
             candidates['pledge_ratio'].isna()
-            | (candidates['pledge_ratio'] <= 50)
+            | (candidates['pledge_ratio'] <= pledge_ratio_max)
         ].copy()
         if verbose:
             print(f'[7] 排除质押>50% → {before} → {len(candidates)}')
@@ -983,7 +1331,7 @@ class StockSelector:
         before = len(candidates)
         candidates = candidates[
             candidates['goodwill_ratio'].isna()
-            | (candidates['goodwill_ratio'] <= 30)
+            | (candidates['goodwill_ratio'] <= goodwill_ratio_max)
         ].copy()
         if verbose:
             print(f'[8] 排除商誉>30% → {before} → {len(candidates)}')
@@ -1020,7 +1368,7 @@ class StockSelector:
         candidates = candidates[
             candidates['gross_margin'].notna()
             & candidates['industry_avg_gm'].notna()
-            & (candidates['gross_margin'] > candidates['industry_avg_gm'] + 20)
+            & (candidates['gross_margin'] > candidates['industry_avg_gm'] + gross_margin_industry_premium)
         ].copy()
         if verbose:
             print(
@@ -1033,7 +1381,7 @@ class StockSelector:
         # ── Step 3: 3年毛利率趋势斜率 > 0 ──
         before = len(candidates)
         candidates = candidates[
-            candidates['gm_slope'].notna() & (candidates['gm_slope'] > 0)
+            candidates['gm_slope'].notna() & (candidates['gm_slope'] > gm_slope_min)
         ].copy()
         if verbose:
             print(f'[10] 3年毛利率趋势>0 → {before} → {len(candidates)}')
@@ -1053,8 +1401,8 @@ class StockSelector:
             # PE 历史 80% 分位
             pe_series = df['pe_ttm'].dropna()
             pe_series = pe_series[pe_series > 0]
-            if len(pe_series) >= 20:
-                pe_80[sym] = float(np.percentile(pe_series, 80))
+            if len(pe_series) >= pe_history_min_samples:
+                pe_80[sym] = float(np.percentile(pe_series, pe_history_percentile))
             else:
                 pe_80[sym] = None
             # 当前 PE（trade_date 及之前最近交易日）
@@ -1079,11 +1427,17 @@ class StockSelector:
         if verbose:
             print(f'[11] PE<80%分位 → {before} → {len(candidates)}')
 
+        peg_map: Dict[str, Optional[float]] = {}
+        for sym in candidates['symbol']:
+            peg_val, _ = self._calculate_peg(sym, pe_current.get(sym))
+            peg_map[sym] = peg_val
+        candidates['peg'] = candidates['symbol'].map(peg_map)
+
         # ── 整理输出列 ──
         out_cols = [
             'symbol', 'name', 'industry',
             'gross_margin', 'industry_avg_gm', 'gm_slope',
-            'pe_ttm', 'pe_80th', 'market_cap',
+            'pe_ttm', 'peg', 'pe_80th', 'market_cap',
             'avg_amount_60d', 'avg_amplitude_60d',
             'pledge_ratio', 'goodwill_ratio',
         ]
@@ -1096,6 +1450,343 @@ class StockSelector:
             print(f'{"="*70}\n')
 
         return result
+
+    def select_star_value_reversion(
+        self,
+        trade_date: str,
+        verbose: bool = True,
+        enable_tech_filter: Optional[bool] = None,
+        filter_params: Optional[Dict[str, Any]] = None,
+    ) -> pd.DataFrame:
+        """科创超跌价值回归选股入口（不影响现有 select 流程）。"""
+        trade_date = trade_date.replace('-', '')
+        t0 = time.time()
+        params = self._resolve_star_value_reversion_filter_params(filter_params)
+        if enable_tech_filter is not None:
+            params['enable_tech_filter'] = bool(enable_tech_filter)
+
+        listing_days_min = int(params['listing_days_min'])
+        listing_days_max = int(params['listing_days_max'])
+        drawdown_max = float(params['drawdown_from_post_list_high_max'])
+        rev_growth_min = float(params['revenue_growth_since_list_min'])
+        gm_growth_min = float(params['gross_margin_growth_since_list_min'])
+        pledge_ratio_max = float(params['pledge_ratio_max'])
+        goodwill_ratio_max = float(params['goodwill_ratio_max'])
+        debt_ratio_max = float(params['debt_ratio_max'])
+        amp_20d_max = float(params['amp_20d_max'])
+        vol_ratio_20_60_max = float(params['vol_ratio_20_60_max'])
+        avg_turnover_60d_min = float(params['avg_turnover_60d_min'])
+        tech_filter_on = bool(params.get('enable_tech_filter', True))
+
+        if verbose:
+            print(f'\n{"="*70}')
+            print(f'🚀 科创超跌价值回归选股 [{trade_date}]')
+            print(f'{"="*70}')
+
+        all_stocks = self.sim.get_all_stocks_info(force_update=False)
+        candidates = all_stocks.reset_index()
+        candidates = candidates[['symbol', 'name', 'industry', 'list_date']].copy()
+        candidates['symbol'] = candidates['symbol'].astype(str).str.zfill(6)
+        candidates['list_date'] = pd.to_datetime(candidates['list_date'], errors='coerce')
+
+        before = len(candidates)
+        candidates = candidates[candidates['symbol'].map(self._is_star_688_symbol)].copy()
+        if verbose:
+            print(f'[1] 仅保留688 → {before} → {len(candidates)}')
+        if candidates.empty:
+            return pd.DataFrame()
+
+        # 上市 0.5~2 年
+        candidates['listing_days'] = candidates['list_date'].map(lambda d: self._calc_listing_days(d, trade_date))
+        before = len(candidates)
+        candidates = candidates[
+            candidates['listing_days'].notna()
+            & (candidates['listing_days'] >= listing_days_min)
+            & (candidates['listing_days'] <= listing_days_max)
+        ].copy()
+        if verbose:
+            print(f'[2] 上市182~730天 → {before} → {len(candidates)}')
+        if candidates.empty:
+            return pd.DataFrame()
+
+        # ST/退市
+        st_map: Dict[str, bool] = {}
+        delisted_map: Dict[str, bool] = {}
+        for sym in candidates['symbol']:
+            status = self._get_listing_status(sym)
+            st_map[sym] = bool(status.get('is_st', False))
+            delisted_map[sym] = bool(status.get('is_delisted', False))
+        candidates['is_st'] = candidates['symbol'].map(st_map)
+        candidates['is_delisted'] = candidates['symbol'].map(delisted_map)
+        before = len(candidates)
+        candidates = candidates[~candidates['is_st'] & ~candidates['is_delisted']].copy()
+        if verbose:
+            print(f'[3] 排除ST/退市 → {before} → {len(candidates)}')
+        if candidates.empty:
+            return pd.DataFrame()
+
+        # 深跌回撤
+        drawdown_map: Dict[str, Optional[float]] = {}
+        close_map: Dict[str, Optional[float]] = {}
+        high_map: Dict[str, Optional[float]] = {}
+        for i, row in candidates.iterrows():
+            _ = i
+            sym = str(row['symbol'])
+            dd, close_v, high_v = self._calc_post_list_drawdown(sym, trade_date, row['list_date'])
+            drawdown_map[sym] = dd
+            close_map[sym] = close_v
+            high_map[sym] = high_v
+        candidates['drawdown_from_post_list_high'] = candidates['symbol'].map(drawdown_map)
+        candidates['latest_close'] = candidates['symbol'].map(close_map)
+        candidates['post_list_high'] = candidates['symbol'].map(high_map)
+        before = len(candidates)
+        candidates = candidates[
+            candidates['drawdown_from_post_list_high'].notna()
+            & (candidates['drawdown_from_post_list_high'] <= drawdown_max)
+        ].copy()
+        if verbose:
+            print(f'[4] 回撤>=50% → {before} → {len(candidates)}')
+        if candidates.empty:
+            return pd.DataFrame()
+
+        # 不亏损
+        loss_map = {sym: self.is_last_fiscal_year_loss(sym, trade_date) for sym in candidates['symbol']}
+        candidates['is_loss_last_year'] = candidates['symbol'].map(loss_map)
+        before = len(candidates)
+        candidates = candidates[~candidates['is_loss_last_year'].fillna(True).astype(bool)].copy()
+        if verbose:
+            print(f'[5] 最近完整年报不亏损 → {before} → {len(candidates)}')
+        if candidates.empty:
+            return pd.DataFrame()
+
+        # 上市后营收/毛利率增长
+        rev_growth_map: Dict[str, Optional[float]] = {}
+        gm_growth_map: Dict[str, Optional[float]] = {}
+        for _, row in candidates.iterrows():
+            sym = str(row['symbol'])
+            rev_growth, gm_growth = self._calc_growth_since_listing(sym, trade_date, row['list_date'])
+            rev_growth_map[sym] = rev_growth
+            gm_growth_map[sym] = gm_growth
+        candidates['revenue_growth_since_list'] = candidates['symbol'].map(rev_growth_map)
+        candidates['gross_margin_growth_since_list'] = candidates['symbol'].map(gm_growth_map)
+        before = len(candidates)
+        candidates = candidates[
+            candidates['revenue_growth_since_list'].notna()
+            & (candidates['revenue_growth_since_list'] > rev_growth_min)
+            & candidates['gross_margin_growth_since_list'].notna()
+            & (candidates['gross_margin_growth_since_list'] > gm_growth_min)
+        ].copy()
+        if verbose:
+            print(f'[6] 上市后营收/毛利率增长 → {before} → {len(candidates)}')
+        if candidates.empty:
+            return pd.DataFrame()
+
+        # 质押 / 商誉 / 负债率
+        pledge_map = {sym: self.get_pledge_ratio(sym) for sym in candidates['symbol']}
+        goodwill_map = {sym: self.get_goodwill_ratio(sym) for sym in candidates['symbol']}
+        debt_map = {sym: self._calc_debt_ratio(sym, trade_date) for sym in candidates['symbol']}
+        candidates['pledge_ratio'] = candidates['symbol'].map(pledge_map)
+        candidates['goodwill_ratio'] = candidates['symbol'].map(goodwill_map)
+        candidates['debt_ratio'] = candidates['symbol'].map(debt_map)
+        before = len(candidates)
+        candidates = candidates[
+            (candidates['pledge_ratio'].isna() | (candidates['pledge_ratio'] < pledge_ratio_max))
+            & (candidates['goodwill_ratio'].isna() | (candidates['goodwill_ratio'] < goodwill_ratio_max))
+            & candidates['debt_ratio'].notna()
+            & (candidates['debt_ratio'] < debt_ratio_max)
+        ].copy()
+        if verbose:
+            print(f'[7] 质押/商誉/负债率 → {before} → {len(candidates)}')
+        if candidates.empty:
+            return pd.DataFrame()
+
+        # 技术过滤
+        tech_map: Dict[str, dict] = {}
+        for sym in candidates['symbol']:
+            tech_map[sym] = self._calc_star_tech_metrics(sym, trade_date)
+        candidates['amp_20d'] = candidates['symbol'].map(lambda s: tech_map.get(s, {}).get('amp_20d'))
+        candidates['vol_ratio_20_60'] = candidates['symbol'].map(lambda s: tech_map.get(s, {}).get('vol_ratio_20_60'))
+        candidates['avg_turnover_60d'] = candidates['symbol'].map(lambda s: tech_map.get(s, {}).get('avg_turnover_60d'))
+        before = len(candidates)
+        if tech_filter_on:
+            candidates = candidates[
+                candidates['amp_20d'].notna()
+                & (candidates['amp_20d'] <= amp_20d_max)
+                & candidates['vol_ratio_20_60'].notna()
+                & (candidates['vol_ratio_20_60'] < vol_ratio_20_60_max)
+                & candidates['avg_turnover_60d'].notna()
+                & (candidates['avg_turnover_60d'] > avg_turnover_60d_min)
+            ].copy()
+            if verbose:
+                print(f'[8] 底部振幅/缩量/流动性 → {before} → {len(candidates)}')
+            if candidates.empty:
+                return pd.DataFrame()
+        elif verbose:
+            print(f'[8] 底部振幅/缩量/流动性 → 已跳过，保留 {before} 只')
+
+        # 提示指标
+        pe_map = {sym: self.get_current_pe_ttm(sym, trade_date) for sym in candidates['symbol']}
+        peg_map: Dict[str, Optional[float]] = {}
+        rd_ratio_map: Dict[str, Optional[float]] = {}
+        for sym in candidates['symbol']:
+            peg_val, _ = self._calculate_peg(sym, pe_map.get(sym))
+            peg_map[sym] = peg_val
+            rd_ratio_map[sym] = self._calc_rd_to_revenue_ratio(sym, trade_date)
+        candidates['pe_ttm'] = candidates['symbol'].map(pe_map)
+        candidates['peg'] = candidates['symbol'].map(peg_map)
+        candidates['rd_to_revenue_ratio'] = candidates['symbol'].map(rd_ratio_map)
+
+        out_cols = [
+            'symbol', 'name', 'industry', 'list_date', 'listing_days',
+            'latest_close', 'post_list_high', 'drawdown_from_post_list_high',
+            'revenue_growth_since_list', 'gross_margin_growth_since_list',
+            'pledge_ratio', 'goodwill_ratio', 'debt_ratio',
+            'amp_20d', 'vol_ratio_20_60', 'avg_turnover_60d',
+            'pe_ttm', 'peg', 'rd_to_revenue_ratio',
+        ]
+        result = candidates[out_cols].reset_index(drop=True)
+        result.insert(0, 'trade_date', trade_date)
+
+        if verbose:
+            elapsed = time.time() - t0
+            print(f'\n✅ 科创超跌选股完成: {len(result)} 只，耗时 {elapsed:.1f}s')
+            print(f'{"="*70}\n')
+
+        return result
+
+    def preload_star_value_reversion_data(
+        self,
+        start_date: str,
+        end_date: str,
+        force: bool = False,
+        verbose: bool = True,
+    ) -> int:
+        """科创超跌策略专用预加载：首次统一拉满全区间，后续月度选股只读缓存。"""
+        start_date = start_date.replace('-', '')
+        end_date = end_date.replace('-', '')
+
+        all_stocks = self.sim.get_all_stocks_info(force_update=False)
+        candidates = all_stocks.reset_index()[['symbol', 'list_date']].copy()
+        candidates['symbol'] = candidates['symbol'].astype(str).str.zfill(6)
+        candidates['list_date'] = pd.to_datetime(candidates['list_date'], errors='coerce')
+
+        # 对于回测区间 [start_date, end_date]，潜在入池标的上市日期范围：
+        # [start_date-730天, end_date-182天]
+        s = pd.to_datetime(start_date)
+        e = pd.to_datetime(end_date)
+        list_min = s - pd.Timedelta(days=730)
+        list_max = e - pd.Timedelta(days=182)
+
+        candidates = candidates[
+            candidates['symbol'].map(self._is_star_688_symbol)
+            & candidates['list_date'].notna()
+            & (candidates['list_date'] >= list_min)
+            & (candidates['list_date'] <= list_max)
+        ].copy()
+
+        def _star_cache_ready() -> bool:
+            """快速判断科创策略预加载缓存是否完整。"""
+            md = self.dm.metadata or {}
+            end_dt = pd.to_datetime(end_date)
+            for _, row in candidates.iterrows():
+                sym = str(row['symbol'])
+                list_dt = pd.to_datetime(row['list_date'])
+                k_start_dt = max(list_dt, list_min)
+
+                # 1) 日线元数据覆盖检查（优先走 metadata，避免逐文件读取）
+                meta = md.get(sym)
+                if not meta:
+                    return False
+                last_date = meta.get('last_date')
+                first_date = meta.get('first_date')
+                if not last_date or not first_date:
+                    return False
+                try:
+                    last_dt = pd.to_datetime(str(last_date))
+                    first_dt = pd.to_datetime(str(first_date))
+                except Exception:
+                    return False
+                if last_dt < end_dt or first_dt > k_start_dt:
+                    return False
+
+                # 2) 基础缓存文件覆盖检查
+                if not self._cache_path(f'listing_status_{sym}').exists():
+                    return False
+                if not self._cache_path(f'star_vr_daily_basic_{sym}').exists():
+                    return False
+                if not self._cache_path(f'pledge_{sym}').exists():
+                    return False
+                if not self._cache_path(f'goodwill_ratio_{sym}').exists():
+                    return False
+                if not self._cache_path(f'star_vr_bs_debt_{sym}').exists():
+                    return False
+
+                # 3) 财务缓存覆盖检查
+                fm_sym = self.fm.normalize_symbol(sym)
+                if not (self.fm.cache_dir / f'income_{fm_sym}.parquet').exists():
+                    return False
+                if not (self.fm.cache_dir / f'fina_{fm_sym}.parquet').exists():
+                    return False
+            return True
+
+        symbols = candidates['symbol'].tolist()
+        total = len(symbols)
+        if total == 0:
+            if verbose:
+                print('⚠️ 科创预加载无候选标的，跳过。')
+            return 0
+
+        if (not force) and _star_cache_ready():
+            self._daily_data_local_only = True
+            if verbose:
+                print('\n✅ 科创预加载缓存已完整，跳过首次预加载。')
+                print(f'   区间: {start_date} -> {end_date}, 标的数: {total}')
+                print('   后续月度选股直接使用本地缓存。\n')
+            return total
+
+        if verbose:
+            print('\n' + '=' * 70)
+            print('🚚 科创策略首次预加载（统一全区间）')
+            print(f'区间: {start_date} -> {end_date}, 标的数: {total}')
+            print('=' * 70)
+
+        for idx, row in candidates.reset_index(drop=True).iterrows():
+            sym = str(row['symbol'])
+            if verbose and (idx % 20 == 0):
+                print(f'  预加载进度: {idx+1}/{total} ({(idx+1)/total*100:.0f}%)')
+
+            list_dt = pd.to_datetime(row['list_date'])
+            k_start = max(list_dt, list_min).strftime('%Y%m%d')
+
+            # 基础与财务缓存
+            _ = self._get_listing_status(sym)
+            _ = self._get_star_daily_basic(sym)
+            _ = self.get_pledge_ratio(sym)
+            _ = self.get_goodwill_ratio(sym)
+            _ = self._get_balance_sheet_for_debt(sym)
+            _ = self.fm.get_income(sym)
+            _ = self.fm.get_fina_indicator(sym)
+
+            # 日线一次性拉到回测结束日，避免月度循环中反复增量补拉
+            try:
+                k = self.dm.get_stock_data(
+                    symbol=sym,
+                    start_date=k_start,
+                    end_date=end_date,
+                    force_update=force,
+                    adjust='qfq',
+                    allow_api=True,
+                )
+                if k is not None and not k.empty:
+                    self._kline_cache[sym] = k
+            except Exception:
+                pass
+
+        self._daily_data_local_only = True
+        if verbose:
+            print(f'✅ 科创预加载完成: {total}/{total} (100%)')
+            print('   后续月度选股将优先使用本地缓存。\n')
+        return total
 
     def _all_caches_exist(self, symbols: List[str]) -> bool:
         """检查所有核心缓存文件是否存在（任一缺失则返回 False）"""

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import json
 import threading
@@ -28,6 +29,10 @@ from akquant import Strategy, run_backtest
 
 from akq_module_stock_selector import StockSelector
 from akq_module_tusharedatamanager import TushareStockDataManager
+
+
+# mixed bollinger 基础选股参数覆盖：默认保持当前设定；按需在这里统一调整。
+MIXED_BOLLINGER_SELECTOR_FILTER_PARAMS: dict[str, object] = {}
 
 
 class MixedBollingerStrategy(Strategy):
@@ -390,6 +395,7 @@ def build_fundamental_universe(
     token: str,
     trade_date: str,
     data_dir: str = "selector_data",
+    selector_filter_params: Optional[dict[str, object]] = None,
 ) -> pd.DataFrame:
     """使用 StockSelector 构建基本面股票池。"""
     selector = StockSelector(
@@ -397,7 +403,11 @@ def build_fundamental_universe(
         data_dir=data_dir,
         request_interval=0.32,
     )
-    selected = selector.select(trade_date=trade_date, verbose=True)
+    selected = selector.select(
+        trade_date=trade_date,
+        verbose=True,
+        filter_params=selector_filter_params,
+    )
     if selected is None or selected.empty:
         raise RuntimeError("基本面选股结果为空")
     return selected
@@ -422,6 +432,7 @@ def build_weekly_universe(
     data_dir: str = "selector_data",
     preload: bool = True,
     use_weekly_cache: bool = True,
+    selector_filter_params: Optional[dict[str, object]] = None,
 ) -> tuple[dict[str, set[str]], dict[str, str]]:
     """按周构建基本面候选池：仅影响买入门控，不强制卖出。"""
 
@@ -448,10 +459,18 @@ def build_weekly_universe(
         request_interval=0.32,
     )
 
+    effective_selector_params = dict(selector_filter_params or {})
+
+    cache_suffix = f"{start_date}_{end_date}"
+    if effective_selector_params:
+        cfg_text = json.dumps(effective_selector_params, sort_keys=True, ensure_ascii=True)
+        cfg_key = hashlib.md5(cfg_text.encode("utf-8")).hexdigest()[:10]
+        cache_suffix = f"{cache_suffix}_cfg_{cfg_key}"
+
     cache_dir = (
         Path(data_dir)
         / "weekly_universe_cache"
-        / f"{start_date}_{end_date}"
+        / cache_suffix
     )
     if use_weekly_cache:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -490,7 +509,10 @@ def build_weekly_universe(
 
         if use_weekly_cache and cache_file.exists():
             try:
-                df = pd.read_csv(cache_file, dtype={"symbol": "string", "industry": "string"})
+                df = pd.read_csv(
+                    cache_file,
+                    dtype={"symbol": "string", "name": "string", "industry": "string"},
+                )
                 cache_hits += 1
                 elapsed = time.time() - t_week
                 print(
@@ -505,11 +527,12 @@ def build_weekly_universe(
                     fn=selector.select,
                     trade_date=td,
                     verbose=(idx == 1),
+                    filter_params=effective_selector_params,
                 )
                 cache_misses += 1
                 cache_save = pd.DataFrame()
                 if df is not None and (not df.empty):
-                    keep_cols = [c for c in ["symbol", "industry"] if c in df.columns]
+                    keep_cols = [c for c in ["symbol", "name", "industry", "pe_ttm", "peg"] if c in df.columns]
                     if keep_cols:
                         cache_save = df[keep_cols].copy()
                 cache_save.to_csv(cache_file, index=False, encoding="utf-8")
@@ -521,12 +544,13 @@ def build_weekly_universe(
                 fn=selector.select,
                 trade_date=td,
                 verbose=(idx == 1),
+                filter_params=effective_selector_params,
             )
             cache_misses += 1
             if use_weekly_cache:
                 cache_save = pd.DataFrame()
                 if df is not None and (not df.empty):
-                    keep_cols = [c for c in ["symbol", "industry"] if c in df.columns]
+                    keep_cols = [c for c in ["symbol", "name", "industry", "pe_ttm", "peg"] if c in df.columns]
                     if keep_cols:
                         cache_save = df[keep_cols].copy()
                 cache_save.to_csv(cache_file, index=False, encoding="utf-8")
@@ -889,6 +913,7 @@ def main() -> None:
         start_date=start_date,
         end_date=end_date,
         preload=True,
+        selector_filter_params=MIXED_BOLLINGER_SELECTOR_FILTER_PARAMS,
     )
 
     symbols = sorted({s for syms in weekly_universe.values() for s in syms})
