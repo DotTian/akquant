@@ -5,7 +5,10 @@
 """
 
 import logging
-from typing import List, Tuple
+import os
+from typing import Tuple
+
+import pandas as pd
 
 from akquant import Strategy
 from akquant import run_backtest
@@ -16,27 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 class OneToTwoStrategy(Strategy):
-    class OneToTwoStrategy(Strategy):
-        """
-        一进二策略（仅依赖日线数据）
-        核心逻辑（一进二打板）：
-        ------------------------
-        1. 首板确认：昨日收盘价涨停（根据板块区分涨跌幅：主板10%，双创20%，北交所30%）
-        2. 排除一字板：昨日开盘即涨停且最低==最高 → 判定为一字板，跳过
-        3. 次日买入条件：
-        - 高开 3%~7%（参数 high_open_range）
-        - 开盘未涨停（否则买不到）
-        - 今日成交量 ≥ 昨日成交量 × 0.8（参数 volume_ratio_min）
-        4. 卖出规则：
-        - 止损：当日最低价 ≤ 买入价 × 0.95（参数 stop_loss_pct = -5%）
-        - 涨停继续持有
-        - 未涨停则尾盘卖出（T+1规则，当日买入不可当日卖）
-        5. 资金管理：
-        - 每只股票仓位 20%（参数 position_pct）
-        - 最大持仓 5 只（参数 max_positions）
-        - 通过 order_target_percent 下单
-        """
-
     def __init__(self,
                  high_open_range: Tuple[float, float] = (0.03, 0.07),
                  volume_ratio_min: float = 0.8,
@@ -180,49 +162,123 @@ class OneToTwoStrategy(Strategy):
         logger.info("一进二策略运行结束")
 
 
-if __name__ == "__main__":
-    # ================== 数据准备 ==================
-    import os
+def load_a_share_universe(
+    token: str,
+    start_date: str,
+    end_date: str,
+    data_dir: str = 'stock_info_unadj',
+) -> list[str]:
+    """加载回测区间内有效的沪深股票，排除北交所和 ST 股票。"""
+    from akq_module_stockinfo import StockInfoManager
+
+    manager = StockInfoManager(
+        token=token,
+        data_dir=data_dir,
+        request_interval=1.2,
+        auto_update=False,
+    )
+    stocks = manager.get_all_stocks_info(list_status='ALL')
+    if stocks.empty:
+        raise RuntimeError('股票基础信息为空')
+
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    filtered = stocks.copy()
+    filtered = filtered[filtered['exchange'].isin(['SSE', 'SZSE'])]
+    filtered = filtered[
+        ~filtered['name'].fillna('').str.contains('ST', case=False, regex=False)
+    ]
+
+    list_dates = pd.to_datetime(filtered['list_date'], errors='coerce')
+    delist_dates = pd.to_datetime(filtered['delist_date'], errors='coerce')
+    filtered = filtered[(list_dates <= end) & (delist_dates.isna() | (delist_dates >= start))]
+
+    symbols = sorted(filtered.index.astype(str).str.zfill(6).unique().tolist())
+    if not symbols:
+        raise RuntimeError('指定回测区间内没有符合条件的沪深股票')
+
+    logger.info('全市场股票池: %s 只', len(symbols))
+    return symbols
+
+
+def load_market_data(
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+    data_dir: str = 'tsdata_unadj',
+) -> dict[str, pd.DataFrame]:
+    """优先读取本地缓存，仅为缺失标的补拉不复权日线数据。"""
     from akq_module_tusharedatamanager import TushareStockDataManager
 
+    token = os.getenv('TUSHARE_TOKEN')
+    if not token:
+        raise RuntimeError('请先设置环境变量 TUSHARE_TOKEN')
+
+    manager = TushareStockDataManager(
+        token=token,
+        data_dir=data_dir,
+        request_interval=1.5,
+    )
+    raw = manager.get_multiple_stocks(
+        symbols=symbols,
+        start_date=start_date,
+        end_date=end_date,
+        adjust=None,
+        delay_between=0.0,
+        allow_api=False,
+    )
+    missing_symbols = [
+        symbol for symbol, df in raw.items() if df is None or df.empty
+    ]
+    if missing_symbols:
+        logger.info('本地缓存缺失 %s 只，开始补拉不复权行情', len(missing_symbols))
+        fetched = manager.get_multiple_stocks(
+            symbols=missing_symbols,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=None,
+            delay_between=0.0,
+            allow_api=True,
+        )
+        raw.update(fetched)
+
+    data = {
+        str(symbol): df.sort_index()
+        for symbol, df in raw.items()
+        if df is not None and not df.empty
+    }
+    if not data:
+        raise RuntimeError('没有加载到可用行情数据')
+
+    logger.info('可用于回测的标的: %s 只', len(data))
+    return data
+
+
+if __name__ == "__main__":
+    # ================== 数据准备 ==================
     TOKEN = os.getenv('TUSHARE_TOKEN')
     if not TOKEN:
         raise ValueError("请设置环境变量 TUSHARE_TOKEN")
 
-    # 股票池（可以从 Tushare 获取全A股列表，此处示例）
-    STOCK_LIST = [
-        '600519', '000858', '002415', '300750', '601318',
-        '000001', '600000', '601166', '002594', '000333',
-    ]
-
-    start_date = "20240101"
-    end_date = "20241031"
-    DATA_DIR = "tsdata"
-
-    manager = TushareStockDataManager(
+    start_date = "20260101"
+    end_date = "20260812"
+    stock_list = load_a_share_universe(
         token=TOKEN,
-        data_dir=DATA_DIR,
-        request_interval=1.5
-    )
-
-    # 获取所有股票数据（dict: symbol -> DataFrame）
-    stock_data_dict = manager.get_multiple_stocks(
-        symbols=STOCK_LIST,
         start_date=start_date,
         end_date=end_date,
-        delay_between=2.0
     )
-    stock_data_dict = {k: v for k, v in stock_data_dict.items() if not v.empty}
+    stock_data_dict = load_market_data(
+        symbols=stock_list,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    symbols = sorted(stock_data_dict)
 
     # ================== 运行回测 ==================
-    # 单股票回测（可扩展为多股票）
-    first_symbol = list(stock_data_dict.keys())[0]
-    df = stock_data_dict[first_symbol]
-
     result = run_backtest(
         strategy=OneToTwoStrategy,
-        data=df,
-        symbols=[first_symbol],
+        data=stock_data_dict,
+        symbols=symbols,
         initial_cash=1000000.0,
         commission_rate=0.0005,   # 万分之五
         slippage=0.0002,          # 万分之二
@@ -237,11 +293,11 @@ if __name__ == "__main__":
     os.makedirs(report_dir, exist_ok=True)
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"{report_dir}/one_to_two_{first_symbol}_{timestamp}.html"
+    report_path = f"{report_dir}/one_to_two_market_{timestamp}.html"
     result.report(
         filename=report_path,
-        title=f"一进二策略报告 ({first_symbol})",
-        market_data=df,
+        title="一进二策略全市场组合报告",
+        market_data=stock_data_dict,
         include_trade_kline=True
     )
     print(f"\n报告已保存至: {report_path}")

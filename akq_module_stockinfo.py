@@ -101,7 +101,7 @@ class StockInfoManager:
         self.last_request_time = time.time()
 
     # ==================== 核心数据获取 ====================
-    def _fetch_all_stocks(self, max_retries: int = 3) -> pd.DataFrame:
+    def _fetch_all_stocks(self, list_status: str = 'L', max_retries: int = 3) -> pd.DataFrame:
         """
         从 tushare 获取全部A股基本信息（一次性获取，不分页）
         """
@@ -110,16 +110,28 @@ class StockInfoManager:
                 self._wait_if_needed()
                 logger.info("正在从 tushare 获取全部股票基本信息...")
 
-                # stock_basic 接口：fields 可按需选择
-                df = self.pro.stock_basic(
-                    fields="ts_code,symbol,name,area,industry,market,list_date,is_hs,curr_type,exchange,delist_date"
-                )
+                statuses = ('L', 'D', 'P') if list_status == 'ALL' else (list_status,)
+                frames = []
+                for status in statuses:
+                    df_status = self.pro.stock_basic(
+                        list_status=status,
+                        fields=(
+                            "ts_code,symbol,name,area,industry,market,list_date,"
+                            "is_hs,curr_type,exchange,list_status,delist_date"
+                        ),
+                    )
+                    if df_status is not None and not df_status.empty:
+                        frames.append(df_status)
+
+                df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                if not df.empty:
+                    df = df.drop_duplicates(subset=['ts_code'], keep='last')
 
                 if df is None or df.empty:
                     raise ValueError("tushare stock_basic 返回空数据")
 
                 # 处理 symbol（去掉 .SH/.SZ 后缀）
-                df['symbol'] = df['ts_code'].str.replace(r'\.(SH|SZ)$', '', regex=True)
+                df['symbol'] = df['ts_code'].str.replace(r'\.(SH|SZ|BJ)$', '', regex=True)
 
                 # 处理 list_date 为日期类型
                 if 'list_date' in df.columns:
@@ -140,21 +152,24 @@ class StockInfoManager:
                     logger.error("获取全部股票基本信息最终失败")
                     raise
 
+        raise RuntimeError("获取全部股票基本信息失败")
+
     # ==================== 缓存管理 ====================
-    def refresh_cache(self) -> pd.DataFrame:
+    def refresh_cache(self, list_status: str = 'L') -> pd.DataFrame:
         """
         强制从 tushare 刷新全部缓存并保存到本地
         """
-        df = self._fetch_all_stocks()
-        self._save_cache(df)
+        df = self._fetch_all_stocks(list_status=list_status)
+        self._save_cache(df, list_status=list_status)
         self._df = df
         return df
 
-    def _save_cache(self, df: pd.DataFrame):
+    def _save_cache(self, df: pd.DataFrame, list_status: str = 'L'):
         """保存到 Parquet 并更新元数据"""
         df.to_parquet(self.cache_file, index=True)
         self.metadata["last_update"] = datetime.now().isoformat()
         self.metadata["total_stocks"] = len(df)
+        self.metadata["list_status"] = list_status
         self._save_metadata()
         logger.info(f"股票基本信息缓存已保存: {len(df)} 只股票")
 
@@ -177,7 +192,11 @@ class StockInfoManager:
         return self._df
 
     # ==================== 公开 API ====================
-    def get_all_stocks_info(self, force_update: bool = False) -> pd.DataFrame:
+    def get_all_stocks_info(
+        self,
+        force_update: bool = False,
+        list_status: str = 'L',
+    ) -> pd.DataFrame:
         """
         获取所有股票基本信息 DataFrame
 
@@ -185,9 +204,12 @@ class StockInfoManager:
         -----------
         force_update : bool
             是否强制从 tushare 更新
+        list_status : str
+            ``L`` 表示在市股票，``ALL`` 表示合并 L/D/P。
         """
-        if force_update:
-            return self.refresh_cache()
+        cached_status = self.metadata.get('list_status')
+        if force_update or cached_status != list_status:
+            return self.refresh_cache(list_status=list_status)
         return self._get_df()
 
     def get_stock_name(self, symbol: Union[str, int]) -> Optional[str]:

@@ -383,7 +383,7 @@ class TushareStockDataManager:
                     raise
     
     def get_stock_data(self, symbol: str, start_date: str, end_date: str,
-                        force_update: bool = False, adjust: str = 'qfq',
+                        force_update: bool = False, adjust: Optional[str] = 'qfq',
                         allow_api: bool = True) -> pd.DataFrame:
         """
         动态获取股票数据（核心方法）
@@ -562,7 +562,7 @@ class TushareStockDataManager:
         return df[(df.index >= start) & (df.index <= end)]
     
     def get_multiple_stocks(self, symbols: List[str], start_date: str, end_date: str,
-                           force_update: bool = False, adjust: str = 'qfq',
+                           force_update: bool = False, adjust: Optional[str] = 'qfq',
                            delay_between: float = 2.0,
                            allow_api: bool = True) -> Dict[str, pd.DataFrame]:
         """

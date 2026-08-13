@@ -38,6 +38,8 @@ plans/
 /reports/
 /tsdata/
 /stock_info/
+/tsdata_unadj/
+/stock_info_unadj/
 /fundamentals_cache/
 /selector_data/
 /scripts/reports/
