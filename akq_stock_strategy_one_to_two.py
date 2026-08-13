@@ -1,7 +1,18 @@
 """
 一进二打板策略（纯日线版，akquant 框架）
+
+策略定位：
+- 识别“昨日首次涨停、今日可能继续连板”的短线机会。
+- 只使用日线 OHLCV 数据，不依赖分时数据。
+- 核心思路：昨日涨停且非一字板，今日高开且量能放大时优先布局，持仓中以止损和未连板退出为主。
+
+当前版本优化：
+- 增加每日候选强弱打分。
+- 对同日候选按“流动性 + 强度 + 量比 + 连续性”排序。
+- 对每天的候选队列加上前 N 名上限，避免同日全量追票。
+- 只在本策略文件内进行增强，不改框架和其他策略接口。
+
 数据源：Tushare（通过外部获取后传入 run_backtest）
-策略逻辑：首板涨停 → 次日高开买入 → 未连板则尾盘卖出 / 止损
 """
 
 import logging
@@ -25,6 +36,8 @@ class OneToTwoStrategy(Strategy):
                  stop_loss_pct: float = -0.05,
                  position_pct: float = 0.2,
                  max_positions: int = 5,
+                 max_candidates_per_day: int = 5,
+                 min_candidate_amount: float = 1_000_000.0,
                  daily_candidates: dict[str, list[dict[str, Any]]] | None = None):
         """
         初始化策略参数
@@ -35,9 +48,14 @@ class OneToTwoStrategy(Strategy):
         self.stop_loss_pct = stop_loss_pct # 止损阈值（默认-5%）
         self.position_pct = position_pct # 每只股票的仓位比例（默认20%）
         self.max_positions = max_positions # 最大持仓数量（默认5只）
+        self.max_candidates_per_day = max_candidates_per_day # 每日最多只买前N强候选
+        self.min_candidate_amount = min_candidate_amount # 低成交额候选过滤
         self.daily_candidates = daily_candidates or {}
         self.current_candidates: list[dict[str, Any]] = []
         self.current_candidate_index = 0
+        self.trade_history: list[dict[str, Any]] = []
+        self.open_trade_info: dict[str, dict[str, Any]] = {}
+        self.report_dir = './reports'
 
         # 持仓记录（symbol -> 买入价）
         self.buy_prices: dict = {}
@@ -201,6 +219,8 @@ class OneToTwoStrategy(Strategy):
             self.current_bar_date = current_date
 
             self.current_candidates = self.daily_candidates.get(current_date, [])
+            if self.max_candidates_per_day > 0:
+                self.current_candidates = self.current_candidates[: self.max_candidates_per_day]
             self.current_candidate_index = 0
 
         # ========== 有持仓时：检查卖出 ==========
@@ -260,6 +280,13 @@ class OneToTwoStrategy(Strategy):
             self.pending_buy_dates.pop(symbol, None)
             self.buy_prices[symbol] = price
             self.entry_dates[symbol] = trade.timestamp_iso[:10]
+            self.open_trade_info[symbol] = {
+                "symbol": symbol,
+                "buy_date": trade.timestamp_iso[:10],
+                "buy_price": price,
+                "buy_time": trade.timestamp_iso,
+                "buy_reason": self.pending_exit_reasons.get(symbol, "candidate_buy"),
+            }
             self.stats["buy_trades"] += 1
             logger.info(
                 f"[买入成交] {symbol} 价格:{price:.2f}, 日期:{trade.timestamp_iso}"
@@ -272,13 +299,42 @@ class OneToTwoStrategy(Strategy):
             self.pending_exit_dates.pop(symbol, None)
             self.entry_dates.pop(symbol, None)
             self.stats["sell_trades"] += 1
+            trade_info = self.open_trade_info.pop(symbol, {})
             profit_text = ""
+            pnl_pct = None
             if buy_price:
                 profit = (price - buy_price) / buy_price
-                profit_text = f", 盈亏:{profit * 100:.2f}%"
+                pnl_pct = profit * 100
+                profit_text = f", 盈亏:{pnl_pct:.2f}%"
             logger.info(
                 f"[卖出成交] {symbol} 价格:{price:.2f}, 原因:{reason}{profit_text}"
             )
+            if buy_price and trade_info:
+                self.trade_history.append({
+                    "symbol": symbol,
+                    "buy_date": trade_info.get("buy_date"),
+                    "buy_time": trade_info.get("buy_time"),
+                    "buy_price": buy_price,
+                    "sell_date": trade.timestamp_iso[:10],
+                    "sell_time": trade.timestamp_iso,
+                    "sell_price": price,
+                    "pnl_pct": pnl_pct,
+                    "exit_reason": reason,
+                    "buy_reason": trade_info.get("buy_reason", "candidate_buy"),
+                })
+            elif buy_price:
+                self.trade_history.append({
+                    "symbol": symbol,
+                    "buy_date": trade.timestamp_iso[:10],
+                    "buy_time": trade.timestamp_iso,
+                    "buy_price": buy_price,
+                    "sell_date": trade.timestamp_iso[:10],
+                    "sell_time": trade.timestamp_iso,
+                    "sell_price": price,
+                    "pnl_pct": pnl_pct,
+                    "exit_reason": reason,
+                    "buy_reason": "candidate_buy",
+                })
 
     def on_order(self, order: Any) -> None:
         """订单被拒绝或取消时释放待成交状态，允许后续交易重试。"""
@@ -311,11 +367,126 @@ class OneToTwoStrategy(Strategy):
         )
         logger.info("一进二交易统计: %s", self.stats)
 
+    def export_excel_report(self, file_path: str) -> str:
+        """导出每日候选排序、实际成交、未买入候选和汇总统计到 Excel。"""
+        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+
+        candidate_rows: list[dict[str, Any]] = []
+        for date_key, candidates in self.daily_candidates.items():
+            for rank, candidate in enumerate(candidates, start=1):
+                candidate_rows.append({
+                    "date": date_key,
+                    "rank": rank,
+                    "symbol": candidate["symbol"],
+                    "score": candidate.get("score", 0.0),
+                    "open_pct": candidate["open_pct"],
+                    "volume_ratio": candidate["volume_ratio"],
+                    "amount": candidate["amount"],
+                    "today_open": candidate["open"],
+                    "selected": rank <= self.max_candidates_per_day,
+                    "reason": "selected_top_n" if rank <= self.max_candidates_per_day else "filtered_top_n",
+                })
+
+        trade_rows = [dict(row) for row in self.trade_history]
+        missed_rows: list[dict[str, Any]] = []
+        bought_symbols = {row["symbol"] for row in trade_rows}
+        for row in candidate_rows:
+            if row["selected"] and row["symbol"] not in bought_symbols:
+                missed_rows.append({
+                    "date": row["date"],
+                    "rank": row["rank"],
+                    "symbol": row["symbol"],
+                    "score": row["score"],
+                    "open_pct": row["open_pct"],
+                    "volume_ratio": row["volume_ratio"],
+                    "amount": row["amount"],
+                    "missed_reason": "not_traded",
+                })
+            elif not row["selected"]:
+                missed_rows.append({
+                    "date": row["date"],
+                    "rank": row["rank"],
+                    "symbol": row["symbol"],
+                    "score": row["score"],
+                    "open_pct": row["open_pct"],
+                    "volume_ratio": row["volume_ratio"],
+                    "amount": row["amount"],
+                    "missed_reason": "filtered_top_n",
+                })
+
+        summary_rows: list[dict[str, Any]] = []
+        if trade_rows:
+            pnl_values = [float(row.get("pnl_pct", 0.0)) for row in trade_rows if row.get("pnl_pct") is not None]
+            summary_rows.append({
+                "total_candidates": len(candidate_rows),
+                "selected_candidates": sum(1 for row in candidate_rows if row["selected"]),
+                "trades_count": len(trade_rows),
+                "win_count": sum(1 for row in trade_rows if float(row.get("pnl_pct", 0.0) or 0.0) > 0),
+                "loss_count": sum(1 for row in trade_rows if float(row.get("pnl_pct", 0.0) or 0.0) < 0),
+                "avg_pnl_pct": (sum(pnl_values) / len(pnl_values)) if pnl_values else 0.0,
+                "total_pnl_pct": sum(pnl_values),
+            })
+        else:
+            summary_rows.append({
+                "total_candidates": len(candidate_rows),
+                "selected_candidates": sum(1 for row in candidate_rows if row["selected"]),
+                "trades_count": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "avg_pnl_pct": 0.0,
+                "total_pnl_pct": 0.0,
+            })
+
+        try:
+            writer = pd.ExcelWriter(file_path, engine="openpyxl")
+        except Exception:
+            writer = pd.ExcelWriter(file_path, engine="xlsxwriter")
+
+        with writer:
+            pd.DataFrame(candidate_rows).to_excel(writer, sheet_name="Daily_Candidates", index=False)
+            pd.DataFrame(trade_rows).to_excel(writer, sheet_name="Trade_Log", index=False)
+            pd.DataFrame(missed_rows).to_excel(writer, sheet_name="Missed_Candidates", index=False)
+            pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
+
+        logger.info("一进二策略 Excel 报告已生成: %s", file_path)
+        return file_path
+
+
+def _calculate_candidate_score(frame: pd.DataFrame, idx: int, candidate: dict[str, Any]) -> float:
+    """按方案 1 的强弱分层标准给候选股打分：流动性 + 强度 + 量比 + 连续性。"""
+    amount = float(candidate["amount"])
+    open_pct = float(candidate["open_pct"])
+    volume_ratio = float(candidate["volume_ratio"])
+
+    recent_window = frame.iloc[max(0, idx - 5):idx + 1]
+    recent_amounts = pd.to_numeric(
+        recent_window.get("amount", pd.Series([0.0] * len(recent_window))),
+        errors="coerce",
+    ).fillna(0.0)
+    avg_amount = float(recent_amounts.mean()) if not recent_amounts.empty else 0.0
+    liquidity_score = 0.0 if avg_amount <= 0 else min(amount / avg_amount, 2.0) / 2.0
+
+    strength_score = 1.0 - min(abs(open_pct - 0.05) / 0.05, 1.0)
+    volume_score = min(volume_ratio / 1.5, 1.0)
+
+    prev_close = float(frame.iloc[idx - 1].close)
+    prev_prev_close = float(frame.iloc[idx - 2].close)
+    if prev_close > prev_prev_close:
+        continuity_score = 1.0
+    elif prev_close >= prev_prev_close * 0.98:
+        continuity_score = 0.5
+    else:
+        continuity_score = 0.0
+
+    return 0.35 * liquidity_score + 0.30 * strength_score + 0.20 * volume_score + 0.15 * continuity_score
+
 
 def build_daily_candidates(
     data: dict[str, pd.DataFrame],
     high_open_range: Tuple[float, float] = (0.03, 0.07),
     volume_ratio_min: float = 0.8,
+    min_candidate_amount: float = 1_000_000.0,
+    max_candidates_per_day: int = 5,
 ) -> dict[str, list[dict[str, Any]]]:
     """预计算每日一进二候选，并按流动性和信号质量稳定排序。"""
     candidates_by_date: dict[str, list[dict[str, Any]]] = {}
@@ -352,26 +523,34 @@ def build_daily_candidates(
                 continue
 
             amount = float(yesterday.get("amount", 0.0) or 0.0)
+            if amount <= 0:
+                continue
+            if amount < min_candidate_amount:
+                continue
+
             date_key = pd.Timestamp(frame.index[index]).strftime("%Y-%m-%d")
-            candidates_by_date.setdefault(date_key, []).append(
-                {
-                    "symbol": str(symbol),
-                    "open": float(today.open),
-                    "open_pct": open_pct,
-                    "volume_ratio": volume_ratio,
-                    "amount": amount,
-                }
-            )
+            candidate = {
+                "symbol": str(symbol),
+                "open": float(today.open),
+                "open_pct": open_pct,
+                "volume_ratio": volume_ratio,
+                "amount": amount,
+            }
+            candidate["score"] = _calculate_candidate_score(frame, index, candidate)
+            candidates_by_date.setdefault(date_key, []).append(candidate)
 
     for date_key, candidates in candidates_by_date.items():
         candidates.sort(
             key=lambda candidate: (
+                -candidate["score"],
                 -candidate["amount"],
                 abs(candidate["open_pct"] - 0.05),
                 -candidate["volume_ratio"],
                 candidate["symbol"],
             )
         )
+        if max_candidates_per_day > 0:
+            candidates[:] = candidates[:max_candidates_per_day]
 
     logger.info(
         "每日候选预计算完成: 交易日=%s, 候选=%s",
@@ -486,18 +665,23 @@ if __name__ == "__main__":
         stock_data_dict,
         high_open_range=(0.03, 0.07),
         volume_ratio_min=0.8,
+        min_candidate_amount=1_000_000.0,
+        max_candidates_per_day=5,
     )
 
     # ================== 运行回测 ==================
+    strategy = OneToTwoStrategy(
+        high_open_range=(0.03, 0.07),
+        volume_ratio_min=0.8,
+        stop_loss_pct=-0.05,
+        position_pct=0.2,
+        max_positions=5,
+        max_candidates_per_day=5,
+        min_candidate_amount=1_000_000.0,
+        daily_candidates=daily_candidates,
+    )
     result = run_backtest(
-        strategy=OneToTwoStrategy(
-            high_open_range=(0.03, 0.07),
-            volume_ratio_min=0.8,
-            stop_loss_pct=-0.05,
-            position_pct=0.2,
-            max_positions=5,
-            daily_candidates=daily_candidates,
-        ),
+        strategy=strategy,
         data=stock_data_dict,
         symbols=symbols,
         initial_cash=1000000.0,
@@ -521,4 +705,8 @@ if __name__ == "__main__":
         market_data=stock_data_dict,
         include_trade_kline=True
     )
+
+    excel_path = f"{report_dir}/one_to_two_daily_report_{timestamp}.xlsx"
+    strategy.export_excel_report(excel_path)
     print(f"\n报告已保存至: {report_path}")
+    print(f"Excel 明细已保存至: {excel_path}")
