@@ -1,4 +1,4 @@
-# 基本面 + 布林/ADX 共振策略系统说明
+# 周度基本面 + 布林/ADX 共振策略系统说明
 
 ## 1. 系统目标
 该策略系统用于 A 股多标的组合回测，核心目标是把选股、择时、仓位控制和风险退出整合到一个统一流程中。
@@ -13,7 +13,7 @@
 
 ## 2. 代码结构
 1. 选股模块：[akq_module_stock_selector.py](../akq_module_stock_selector.py)
-2. 策略主模块：[akq_stock_strategy_mixed_bollinger.py](../akq_stock_strategy_mixed_bollinger.py)
+2. 策略主模块：[akq_stock_strategy_weekly_mixed_bollinger.py](../akq_stock_strategy_weekly_mixed_bollinger.py)
 3. 数据管理模块：[akq_module_tusharedatamanager.py](../akq_module_tusharedatamanager.py)
 4. 轻量验证脚本：[scripts/validate_mixed_bollinger_light.py](../scripts/validate_mixed_bollinger_light.py)
 
@@ -66,7 +66,7 @@
 买入必须同时满足：
 1. 布林买入：昨日收盘 <= 昨日下轨，且今日收盘 > 今日下轨。
 2. ADX 确认：
-   - ADX >= 阈值（默认 20）
+   - ADX >= 阈值（默认 15）
    - +DI > -DI
 
 仅当两者同一 bar 同时成立，才生成可买入候选。
@@ -117,7 +117,7 @@ strength = boll_deviation * adx_value
 
 ## 7. 回测层配置
 当前主脚本默认回测参数：
-1. 回测区间：2026-01-01 到 2026-07-27
+1. 回测区间：2026-01-01 到 2026-08-12
 2. 市场规则：A 股 T+1
 3. 手续费：
    - 佣金 0.00025
@@ -127,6 +127,7 @@ strength = boll_deviation * adx_value
 4. 交易单位：lot_size = 100
 5. fill_policy：open + bar_offset=1
 6. 时区：Asia/Shanghai
+7. 报告文件命名：reports/weekly_mixed_bollinger_adx_YYYYMMDD_HHMMSS.html
 
 ---
 

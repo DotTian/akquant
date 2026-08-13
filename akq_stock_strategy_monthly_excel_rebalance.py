@@ -18,7 +18,12 @@ from typing import Any
 import pandas as pd
 from akquant import Strategy, run_backtest
 
+from akq_module_stock_selector import StockSelector
 from akq_module_tusharedatamanager import TushareStockDataManager
+
+
+# 月度 Excel 调仓策略对应的选股参数覆盖：默认保持当前设定；按需在这里统一调整。
+MONTHLY_EXCEL_REBALANCE_SELECTOR_FILTER_PARAMS: dict[str, object] = {}
 
 
 class MonthlyExcelRebalanceStrategy(Strategy):
@@ -198,13 +203,58 @@ def load_market_data(
 
 def main() -> None:
     """执行月度调仓回测。"""
-    excel_path = "reports/stock_selection_results_20260715_215442.xlsx"
+    run_selector_first = True
+    selector_start_date = "20260101"
+    selector_end_date = "20260812"
+    selector_data_dir = "selector_data"
+    selector_industries: list[str] | None = [
+        "半导体",
+        "元器件",
+        "医疗保健",
+        "化学制药",
+        "生物制药",
+        "医药商业",
+        "工业金属",
+        "小金属",
+        "贵金属",
+        "能源金属",
+        "化学制品",
+        "化学原料",
+    ]
+
     sheet_name = "详细结果"
     top_n = 5
     data_dir = "tsdata"
 
+    report_dir = Path("reports")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if run_selector_first:
+        token = os.getenv("TUSHARE_TOKEN")
+        if not token:
+            raise RuntimeError("Environment variable TUSHARE_TOKEN is required")
+
+        excel_path = report_dir / f"stock_selection_results_{timestamp}.xlsx"
+        selector = StockSelector(
+            token=token,
+            industries=selector_industries,
+            data_dir=selector_data_dir,
+            request_interval=0.32,
+        )
+        selector.run_monthly(
+            start_date=selector_start_date,
+            end_date=selector_end_date,
+            output_excel=str(excel_path),
+            verbose=True,
+            preload=True,
+            filter_params=MONTHLY_EXCEL_REBALANCE_SELECTOR_FILTER_PARAMS,
+        )
+    else:
+        excel_path = Path("reports/stock_selection_results_20260715_215442.xlsx")
+
     month_to_symbols = load_monthly_selection(
-        excel_path=excel_path,
+        excel_path=str(excel_path),
         sheet_name=sheet_name,
         top_n=top_n,
     )
@@ -268,9 +318,6 @@ def main() -> None:
         print("\n=== 最终持仓 ===")
         print(result.positions.iloc[-1])
 
-    report_dir = Path("reports")
-    report_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = report_dir / f"monthly_excel_rebalance_strategy_{timestamp}.html"
 
     plot_symbol = tradable_symbols[0] if tradable_symbols else None

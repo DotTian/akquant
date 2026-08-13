@@ -1969,6 +1969,7 @@ class StockSelector:
         output_excel: Optional[str] = None,
         verbose: bool = True,
         preload: bool = True,
+        filter_params: Optional[Dict[str, Any]] = None,
     ) -> pd.DataFrame:
         """
         月度选股回测：每月1号选股，汇总结果。
@@ -1986,6 +1987,8 @@ class StockSelector:
             是否打印详细信息
         preload : bool
             是否预加载数据
+        filter_params : Dict[str, Any] or None
+            mixed bollinger 选股参数覆盖，透传至 select()
 
         Returns
         -------
@@ -2014,7 +2017,11 @@ class StockSelector:
                 print(f'{"#"*70}')
 
             try:
-                df_month = self.select(trade_date=td, verbose=verbose)
+                df_month = self.select(
+                    trade_date=td,
+                    verbose=verbose,
+                    filter_params=filter_params,
+                )
                 df_month['month'] = dt.strftime('%Y-%m')
                 all_results.append(df_month)
                 summary_rows.append({
@@ -2130,7 +2137,7 @@ if __name__ == '__main__':
 
     df_results = sel.run_monthly(
         start_date='20260101',
-        end_date='20260715',
+        end_date='20260811',
         output_excel=str(report_path),
         verbose=True,
         #preload=False

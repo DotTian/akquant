@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from akq_stock_strategy_mixed_bollinger import MixedBollingerStrategy
+from akq_stock_strategy_weekly_mixed_bollinger import MixedBollingerStrategy
 
 
 SignalKey = Tuple[str, int]

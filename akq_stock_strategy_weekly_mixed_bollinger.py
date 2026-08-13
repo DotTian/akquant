@@ -2,7 +2,7 @@
 混合策略：基本面股票池 + 布林线与 ADX 共振择时（akquant 版本）
 
 策略要点：
-1. 股票池来源：StockSelector 基本面筛选结果。
+1. 股票池来源：StockSelector 基本面筛选结果。 基于基本面周度选股，每周一更新候选池，买入时仅允许在最近 N 周的候选池中。
 2. 买入信号：近 N 日触下轨后回到下轨上方即可买入；若同时满足 ADX 趋势确认，则优先级更高。
 3. 仓位控制：总计 10 个仓位，每仓 10%，单行业最多 3 只。
 4. 同行业候选超限时，按 strength = boll_deviation * adx_value 由强到弱优先。
@@ -905,7 +905,7 @@ def main() -> None:
         raise RuntimeError("请先设置环境变量 TUSHARE_TOKEN")
 
     start_date = "20260101"
-    end_date = "20260727"
+    end_date = "20260812"
     data_dir = "tsdata"
 
     weekly_universe, industry_by_symbol = build_weekly_universe(
@@ -973,8 +973,8 @@ def main() -> None:
     report_dir = Path("reports")
     report_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = report_dir / f"mixed_bollinger_adx_{timestamp}.html"
-    run_id = f"mixed_bollinger_adx_{timestamp}"
+    report_path = report_dir / f"weekly_mixed_bollinger_adx_{timestamp}.html"
+    run_id = f"weekly_mixed_bollinger_adx_{timestamp}"
 
     plot_symbol = tradable_symbols[0] if tradable_symbols else None
     result.report(
