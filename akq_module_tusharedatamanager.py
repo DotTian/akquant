@@ -280,8 +280,9 @@ class TushareStockDataManager:
             '399550'
         }
 
-    def _fetch_from_tushare(self, symbol: str, start_date: str, end_date: str, 
-                            adjust: str = 'qfq', max_retries: int = 3) -> pd.DataFrame:
+    def _fetch_from_tushare(self, symbol: str, start_date: str, end_date: str,
+                            adjust: str = 'qfq', max_retries: int = 3,
+                            show_detail: bool = True) -> pd.DataFrame:
         """
         从 Tushare 获取数据（带重试机制）
         
@@ -358,8 +359,9 @@ class TushareStockDataManager:
                 if df.empty:
                     raise ValueError(f"数据转换后为空: {ts_code}")
                 
-                logger.info(f"成功获取 {symbol} 数据: {len(df)} 条, "
-                           f"日期范围 {df.index.min().strftime('%Y-%m-%d')} - {df.index.max().strftime('%Y-%m-%d')}")
+                if show_detail:
+                    logger.info(f"成功获取 {symbol} 数据: {len(df)} 条, "
+                               f"日期范围 {df.index.min().strftime('%Y-%m-%d')} - {df.index.max().strftime('%Y-%m-%d')}")
                 
                 return df
                 
@@ -384,7 +386,7 @@ class TushareStockDataManager:
     
     def get_stock_data(self, symbol: str, start_date: str, end_date: str,
                         force_update: bool = False, adjust: Optional[str] = 'qfq',
-                        allow_api: bool = True) -> pd.DataFrame:
+                        allow_api: bool = True, show_detail: bool = True) -> pd.DataFrame:
         """
         动态获取股票数据（核心方法）
         - 优先读取本地 Parquet 缓存
@@ -441,7 +443,8 @@ class TushareStockDataManager:
 
             aligned_start, aligned_end = self._align_trade_window(symbol, start_date_clean, end_date_clean)
             if aligned_start == '' and aligned_end == '':
-                logger.info(f'{symbol} 请求区间中无交易日，跳过获取')
+                if show_detail:
+                    logger.info(f'{symbol} 请求区间中无交易日，跳过获取')
                 return pd.DataFrame()
             start_date_clean = aligned_start or start_date_clean
             end_date_clean = aligned_end or end_date_clean
@@ -466,6 +469,7 @@ class TushareStockDataManager:
                             missing_end,
                             adjust=adjust,
                             max_retries=1,
+                            show_detail=show_detail,
                         )
                     if not df_early.empty:
                         df_existing = pd.concat([df_early, df_existing])
@@ -495,6 +499,7 @@ class TushareStockDataManager:
                             missing_end,
                             adjust=adjust,
                             max_retries=1,
+                            show_detail=show_detail,
                         )
                     if not df_late.empty:
                         df_existing = pd.concat([df_existing, df_late])
@@ -510,7 +515,12 @@ class TushareStockDataManager:
 
             # 6. 如有补充，保存更新后的数据
             if need_save:
-                self._save_data(df_existing, file_path, symbol)
+                self._save_data(
+                    df_existing,
+                    file_path,
+                    symbol,
+                    show_detail=show_detail,
+                )
 
             # 7. 按请求日期裁剪最终返回
             return self._trim_by_date(df_existing, start_date_clean, end_date_clean)
@@ -520,7 +530,8 @@ class TushareStockDataManager:
 
         aligned_start, aligned_end = self._align_trade_window(symbol, start_date_clean, end_date_clean)
         if aligned_start == '' and aligned_end == '':
-            logger.info(f'{symbol} 请求区间中无交易日，跳过获取')
+            if show_detail:
+                logger.info(f'{symbol} 请求区间中无交易日，跳过获取')
             return pd.DataFrame()
         start_date_clean = aligned_start or start_date_clean
         end_date_clean = aligned_end or end_date_clean
@@ -529,18 +540,32 @@ class TushareStockDataManager:
 
         # 1. 强制更新：重新获取全部数据
         if force_update:
-            logger.info(f"强制更新 {symbol} 全部数据...")
-            df_new = self._fetch_from_tushare(symbol, start_date_clean, end_date_clean, adjust=adjust)
-            self._save_data(df_new, file_path, symbol)
+            if show_detail:
+                logger.info(f"强制更新 {symbol} 全部数据...")
+            df_new = self._fetch_from_tushare(
+                symbol, start_date_clean, end_date_clean,
+                adjust=adjust, show_detail=show_detail,
+            )
+            self._save_data(df_new, file_path, symbol, show_detail=show_detail)
             return df_new
 
         # 2. 文件不存在：首次获取全部数据
-        logger.info(f"首次获取 {symbol} 数据...")
-        df_new = self._fetch_from_tushare(symbol, start_date_clean, end_date_clean, adjust=adjust)
-        self._save_data(df_new, file_path, symbol)
+        if show_detail:
+            logger.info(f"首次获取 {symbol} 数据...")
+        df_new = self._fetch_from_tushare(
+            symbol, start_date_clean, end_date_clean,
+            adjust=adjust, show_detail=show_detail,
+        )
+        self._save_data(df_new, file_path, symbol, show_detail=show_detail)
         return df_new
     
-    def _save_data(self, df: pd.DataFrame, file_path: Path, symbol: str):
+    def _save_data(
+        self,
+        df: pd.DataFrame,
+        file_path: Path,
+        symbol: str,
+        show_detail: bool = True,
+    ):
         """保存数据到 Parquet 并更新元数据"""
         df.to_parquet(file_path, index=True)
         
@@ -553,7 +578,8 @@ class TushareStockDataManager:
             'data_source': 'tushare'
         }
         self._save_metadata()
-        logger.info(f"数据已保存: {file_path}")
+        if show_detail:
+            logger.info(f"数据已保存: {file_path}")
     
     def _trim_by_date(self, df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
         """按日期范围裁剪数据"""
@@ -564,7 +590,9 @@ class TushareStockDataManager:
     def get_multiple_stocks(self, symbols: List[str], start_date: str, end_date: str,
                            force_update: bool = False, adjust: Optional[str] = 'qfq',
                            delay_between: float = 2.0,
-                           allow_api: bool = True) -> Dict[str, pd.DataFrame]:
+                           allow_api: bool = True,
+                           show_detail: bool = True,
+                           progress_interval: int = 1) -> Dict[str, pd.DataFrame]:
         """
         批量获取多只股票数据
         
@@ -584,6 +612,10 @@ class TushareStockDataManager:
             每只股票之间的延迟（秒）
         allow_api : bool
             是否允许访问 Tushare。False 时仅使用本地缓存。
+        show_detail : bool
+            是否输出每只股票的获取和保存明细。异常和重试日志始终保留。
+        progress_interval : int
+            进度日志间隔。仅在 ``show_detail=False`` 时用于周期性输出。
         
         Returns:
         --------
@@ -591,8 +623,17 @@ class TushareStockDataManager:
         """
         results = {}
         
+        progress_interval = max(1, progress_interval)
+        total = len(symbols)
         for i, symbol in enumerate(symbols):
-            logger.info(f"\n处理 ({i+1}/{len(symbols)}): {symbol}")
+            should_log_progress = (
+                show_detail
+                or i == 0
+                or i == total - 1
+                or (i + 1) % progress_interval == 0
+            )
+            if should_log_progress:
+                logger.info(f"处理进度: {i + 1}/{total} ({symbol})")
             
             try:
                 df = self.get_stock_data(
@@ -602,6 +643,7 @@ class TushareStockDataManager:
                     force_update=force_update,
                     adjust=adjust,
                     allow_api=allow_api,
+                    show_detail=show_detail,
                 )
                 results[symbol] = df
                 
@@ -614,6 +656,10 @@ class TushareStockDataManager:
                 logger.error(f"处理 {symbol} 失败: {e}")
                 results[symbol] = pd.DataFrame()
         
+        logger.info(
+            f"批量处理完成: {len(results)}/{total}, "
+            f"成功 {sum(not df.empty for df in results.values())}"
+        )
         return results
     
     def update_all_to_latest(self, symbols: List[str], days_back: int = 5) -> Dict[str, pd.DataFrame]:

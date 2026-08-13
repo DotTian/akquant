@@ -6,11 +6,11 @@
 
 import logging
 import os
-from typing import Tuple
+from typing import Any, Tuple
 
 import pandas as pd
 
-from akquant import Strategy
+from akquant import Strategy, TimeInForce
 from akquant import run_backtest
 
 
@@ -29,14 +29,32 @@ class OneToTwoStrategy(Strategy):
         初始化策略参数
         """
         super().__init__()
-        self.high_open_range = high_open_range
-        self.volume_ratio_min = volume_ratio_min
-        self.stop_loss_pct = stop_loss_pct
-        self.position_pct = position_pct
-        self.max_positions = max_positions
+        self.high_open_range = high_open_range # 高开幅度范围（默认3%~7%）
+        self.volume_ratio_min = volume_ratio_min # 成交量放大倍数阈值
+        self.stop_loss_pct = stop_loss_pct # 止损阈值（默认-5%）
+        self.position_pct = position_pct # 每只股票的仓位比例（默认20%）
+        self.max_positions = max_positions # 最大持仓数量（默认5只）
 
         # 持仓记录（symbol -> 买入价）
         self.buy_prices: dict = {}
+        self.pending_buy_prices: dict = {}
+        self.pending_buy_dates: dict = {}
+        self.pending_exit_reasons: dict = {}
+        self.pending_exit_dates: dict = {}
+        self.entry_dates: dict = {}
+        self.current_bar_date: str | None = None
+        self.stats = {
+            "buy_candidates": 0,
+            "skipped_max_positions": 0,
+            "skipped_pending_buy": 0,
+            "buy_orders_submitted": 0,
+            "buy_trades": 0,
+            "sell_orders_submitted": 0,
+            "sell_trades": 0,
+            "stop_loss_exits": 0,
+            "non_limit_exits": 0,
+            "expired_buy_orders": 0,
+        }
         self.set_history_depth(10)
 
     def _get_limit_price(self, symbol: str, prev_close: float) -> float:
@@ -130,36 +148,133 @@ class OneToTwoStrategy(Strategy):
         每根日线触发一次
         """
         symbol = bar.symbol
+        current_date = bar.timestamp_iso[:10]
         position = self.get_position(symbol)
         current_price = bar.close
 
+        # 日线订单默认只服务于当日；交易日切换时统一释放前一日未成交订单。
+        if self.current_bar_date != current_date:
+            stale_buy_symbols = [
+                pending_symbol
+                for pending_symbol, pending_date in self.pending_buy_dates.items()
+                if pending_date != current_date
+            ]
+            for pending_symbol in stale_buy_symbols:
+                self.pending_buy_prices.pop(pending_symbol, None)
+                self.pending_buy_dates.pop(pending_symbol, None)
+                self.stats["expired_buy_orders"] += 1
+            self.current_bar_date = current_date
+
         # ========== 有持仓时：检查卖出 ==========
         if position > 0:
+            # 卖单跨日未成交时，本次重新判断；若已成交，on_trade 会先消费原始原因。
+            if (
+                symbol in self.pending_exit_reasons
+                and self.pending_exit_dates.get(symbol) != current_date
+            ):
+                self.pending_exit_reasons.pop(symbol, None)
+                self.pending_exit_dates.pop(symbol, None)
+            if symbol in self.pending_exit_reasons:
+                return
+            if self.entry_dates.get(symbol) == bar.timestamp_iso[:10]:
+                return
             should_exit, reason = self._should_exit(symbol, bar)
             if should_exit:
                 self.close_position(symbol)
-                profit = (current_price - self.buy_prices[symbol]) / self.buy_prices[symbol]
-                logger.info(f"[卖出] {symbol} 价格:{current_price:.2f}, 原因:{reason}, "
-                            f"盈亏:{profit*100:.2f}%")
-                self.buy_prices.pop(symbol, None)
+                self.pending_exit_reasons[symbol] = reason
+                self.pending_exit_dates[symbol] = current_date
+                self.stats["sell_orders_submitted"] += 1
+                if reason.startswith("止损"):
+                    self.stats["stop_loss_exits"] += 1
+                else:
+                    self.stats["non_limit_exits"] += 1
             return
 
         # ========== 空仓时：检查买入 ==========
-        if len(self.buy_prices) >= self.max_positions:
+        if symbol in self.pending_buy_prices:
+            self.stats["skipped_pending_buy"] += 1
+            return
+
+        reserved_positions = len(self.buy_prices) + len(self.pending_buy_prices)
+        if reserved_positions >= self.max_positions:
+            self.stats["skipped_max_positions"] += 1
             return
 
         if not self._should_buy_today(bar):
             return
 
+        self.stats["buy_candidates"] += 1
         # 满足条件，以开盘价买入
         buy_price = bar.open
-        self.order_target_percent(self.position_pct, symbol, price=buy_price)
-        self.buy_prices[symbol] = buy_price
-        logger.info(f"[买入] {symbol} 价格:{buy_price:.2f}, 日期:{bar.datetime}")
+        self.order_target_percent(
+            self.position_pct,
+            symbol,
+            price=buy_price,
+            time_in_force=TimeInForce.IOC,
+        )
+        self.pending_buy_prices[symbol] = buy_price
+        self.pending_buy_dates[symbol] = current_date
+        self.stats["buy_orders_submitted"] += 1
+
+    def on_trade(self, trade: Any) -> None:
+        """按实际成交回报维护持仓状态，避免把未成交订单当成持仓。"""
+        symbol = trade.symbol
+        side = getattr(trade.side, "name", str(trade.side)).lower()
+        price = float(trade.price)
+
+        if side.endswith("buy"):
+            self.pending_buy_prices.pop(symbol, None)
+            self.pending_buy_dates.pop(symbol, None)
+            self.buy_prices[symbol] = price
+            self.entry_dates[symbol] = trade.timestamp_iso[:10]
+            self.stats["buy_trades"] += 1
+            logger.info(
+                f"[买入成交] {symbol} 价格:{price:.2f}, 日期:{trade.timestamp_iso}"
+            )
+            return
+
+        if side.endswith("sell"):
+            buy_price = self.buy_prices.pop(symbol, None)
+            reason = self.pending_exit_reasons.pop(symbol, "卖出")
+            self.pending_exit_dates.pop(symbol, None)
+            self.entry_dates.pop(symbol, None)
+            self.stats["sell_trades"] += 1
+            profit_text = ""
+            if buy_price:
+                profit = (price - buy_price) / buy_price
+                profit_text = f", 盈亏:{profit * 100:.2f}%"
+            logger.info(
+                f"[卖出成交] {symbol} 价格:{price:.2f}, 原因:{reason}{profit_text}"
+            )
+
+    def on_order(self, order: Any) -> None:
+        """订单被拒绝或取消时释放待成交状态，允许后续交易重试。"""
+        status = getattr(order.status, "name", str(order.status)).lower()
+        if status not in {"rejected", "cancelled", "canceled", "expired"}:
+            return
+
+        symbol = order.symbol
+        side = getattr(order.side, "name", str(order.side)).lower()
+        if side.endswith("buy"):
+            self.pending_buy_prices.pop(symbol, None)
+            self.pending_buy_dates.pop(symbol, None)
+        elif side.endswith("sell"):
+            self.pending_exit_reasons.pop(symbol, None)
+            self.pending_exit_dates.pop(symbol, None)
+
+    def on_reject(self, order: Any) -> None:
+        """拒单回调，与订单状态回调共用待成交状态清理逻辑。"""
+        self.on_order(order)
 
     def on_stop(self):
         """策略结束，清理"""
-        logger.info("一进二策略运行结束")
+        logger.info(
+            "一进二策略运行结束: 持仓=%s, 待买入=%s, 待卖出=%s",
+            len(self.buy_prices),
+            len(self.pending_buy_prices),
+            len(self.pending_exit_reasons),
+        )
+        logger.info("一进二交易统计: %s", self.stats)
 
 
 def load_a_share_universe(
@@ -217,30 +332,20 @@ def load_market_data(
     manager = TushareStockDataManager(
         token=token,
         data_dir=data_dir,
-        request_interval=1.5,
+        request_interval=0.3,
     )
+    # 允许管理器检查缓存覆盖区间，并为不完整缓存补拉早期/最新行情。
+    # 仅用 allow_api=False 无法区分“空缓存”和“区间不完整的非空缓存”。
     raw = manager.get_multiple_stocks(
         symbols=symbols,
         start_date=start_date,
         end_date=end_date,
         adjust=None,
         delay_between=0.0,
-        allow_api=False,
+        allow_api=True,
+        show_detail=False,
+        progress_interval=100,
     )
-    missing_symbols = [
-        symbol for symbol, df in raw.items() if df is None or df.empty
-    ]
-    if missing_symbols:
-        logger.info('本地缓存缺失 %s 只，开始补拉不复权行情', len(missing_symbols))
-        fetched = manager.get_multiple_stocks(
-            symbols=missing_symbols,
-            start_date=start_date,
-            end_date=end_date,
-            adjust=None,
-            delay_between=0.0,
-            allow_api=True,
-        )
-        raw.update(fetched)
 
     data = {
         str(symbol): df.sort_index()
@@ -260,7 +365,7 @@ if __name__ == "__main__":
     if not TOKEN:
         raise ValueError("请设置环境变量 TUSHARE_TOKEN")
 
-    start_date = "20260101"
+    start_date = "20220101"
     end_date = "20260812"
     stock_list = load_a_share_universe(
         token=TOKEN,
@@ -276,7 +381,13 @@ if __name__ == "__main__":
 
     # ================== 运行回测 ==================
     result = run_backtest(
-        strategy=OneToTwoStrategy,
+        strategy=OneToTwoStrategy(
+            high_open_range=(0.03, 0.07),
+            volume_ratio_min=0.8,
+            stop_loss_pct=-0.05,
+            position_pct=0.2,
+            max_positions=5
+        ),
         data=stock_data_dict,
         symbols=symbols,
         initial_cash=1000000.0,

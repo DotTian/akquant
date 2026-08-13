@@ -115,7 +115,7 @@ if __name__ == "__main__":
     manager = TushareStockDataManager(
         token= mytoken,  # 替换为你的实际 Token # type: ignore
         data_dir=DATA_DIR,
-        request_interval=1.5  # 请求间隔 1.5 秒
+        request_interval=0.3  # 请求间隔 1.5 秒
     )
     df = manager.get_stock_data(symbol=symbol, start_date=start_date, end_date=end_date)
     
