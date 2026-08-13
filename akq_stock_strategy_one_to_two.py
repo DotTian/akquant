@@ -24,7 +24,8 @@ class OneToTwoStrategy(Strategy):
                  volume_ratio_min: float = 0.8,
                  stop_loss_pct: float = -0.05,
                  position_pct: float = 0.2,
-                 max_positions: int = 5):
+                 max_positions: int = 5,
+                 daily_candidates: dict[str, list[dict[str, Any]]] | None = None):
         """
         初始化策略参数
         """
@@ -34,6 +35,9 @@ class OneToTwoStrategy(Strategy):
         self.stop_loss_pct = stop_loss_pct # 止损阈值（默认-5%）
         self.position_pct = position_pct # 每只股票的仓位比例（默认20%）
         self.max_positions = max_positions # 最大持仓数量（默认5只）
+        self.daily_candidates = daily_candidates or {}
+        self.current_candidates: list[dict[str, Any]] = []
+        self.current_candidate_index = 0
 
         # 持仓记录（symbol -> 买入价）
         self.buy_prices: dict = {}
@@ -54,7 +58,13 @@ class OneToTwoStrategy(Strategy):
             "stop_loss_exits": 0,
             "non_limit_exits": 0,
             "expired_buy_orders": 0,
+            "candidate_pool_size": 0,
+            "candidate_days": 0,
         }
+        self.stats["candidate_pool_size"] = sum(
+            len(candidates) for candidates in self.daily_candidates.values()
+        )
+        self.stats["candidate_days"] = len(self.daily_candidates)
         self.set_history_depth(10)
 
     def _get_limit_price(self, symbol: str, prev_close: float) -> float:
@@ -143,6 +153,31 @@ class OneToTwoStrategy(Strategy):
         # 3. 未涨停，尾盘卖出
         return True, "未连板(尾盘卖出)"
 
+    def _submit_candidate(self, candidate: dict[str, Any], current_date: str) -> None:
+        """提交当前日期排序队列中的下一只候选股票。"""
+        symbol = str(candidate["symbol"])
+        buy_price = float(candidate["open"])
+        self.pending_buy_prices[symbol] = buy_price
+        self.pending_buy_dates[symbol] = current_date
+        self.stats["buy_orders_submitted"] += 1
+        self.order_target_percent(
+            self.position_pct,
+            symbol,
+            price=buy_price,
+            time_in_force=TimeInForce.IOC,
+        )
+
+    def _submit_next_candidate(self, current_date: str) -> None:
+        """IOC 买单未成交时，按排序顺序递补下一只候选。"""
+        if len(self.buy_prices) + len(self.pending_buy_prices) >= self.max_positions:
+            return
+        if self.current_candidate_index >= len(self.current_candidates):
+            return
+
+        candidate = self.current_candidates[self.current_candidate_index]
+        self.current_candidate_index += 1
+        self._submit_candidate(candidate, current_date)
+
     def on_bar(self, bar):
         """
         每根日线触发一次
@@ -164,6 +199,9 @@ class OneToTwoStrategy(Strategy):
                 self.pending_buy_dates.pop(pending_symbol, None)
                 self.stats["expired_buy_orders"] += 1
             self.current_bar_date = current_date
+
+            self.current_candidates = self.daily_candidates.get(current_date, [])
+            self.current_candidate_index = 0
 
         # ========== 有持仓时：检查卖出 ==========
         if position > 0:
@@ -200,21 +238,16 @@ class OneToTwoStrategy(Strategy):
             self.stats["skipped_max_positions"] += 1
             return
 
-        if not self._should_buy_today(bar):
+        if self.current_candidate_index >= len(self.current_candidates):
+            return
+
+        next_candidate = self.current_candidates[self.current_candidate_index]
+        if str(next_candidate["symbol"]) != symbol:
             return
 
         self.stats["buy_candidates"] += 1
-        # 满足条件，以开盘价买入
-        buy_price = bar.open
-        self.order_target_percent(
-            self.position_pct,
-            symbol,
-            price=buy_price,
-            time_in_force=TimeInForce.IOC,
-        )
-        self.pending_buy_prices[symbol] = buy_price
-        self.pending_buy_dates[symbol] = current_date
-        self.stats["buy_orders_submitted"] += 1
+        self.current_candidate_index += 1
+        self._submit_candidate(next_candidate, current_date)
 
     def on_trade(self, trade: Any) -> None:
         """按实际成交回报维护持仓状态，避免把未成交订单当成持仓。"""
@@ -258,6 +291,8 @@ class OneToTwoStrategy(Strategy):
         if side.endswith("buy"):
             self.pending_buy_prices.pop(symbol, None)
             self.pending_buy_dates.pop(symbol, None)
+            if self.current_bar_date is not None:
+                self._submit_next_candidate(self.current_bar_date)
         elif side.endswith("sell"):
             self.pending_exit_reasons.pop(symbol, None)
             self.pending_exit_dates.pop(symbol, None)
@@ -275,6 +310,75 @@ class OneToTwoStrategy(Strategy):
             len(self.pending_exit_reasons),
         )
         logger.info("一进二交易统计: %s", self.stats)
+
+
+def build_daily_candidates(
+    data: dict[str, pd.DataFrame],
+    high_open_range: Tuple[float, float] = (0.03, 0.07),
+    volume_ratio_min: float = 0.8,
+) -> dict[str, list[dict[str, Any]]]:
+    """预计算每日一进二候选，并按流动性和信号质量稳定排序。"""
+    candidates_by_date: dict[str, list[dict[str, Any]]] = {}
+
+    for symbol, frame in data.items():
+        if frame is None or len(frame) < 3:
+            continue
+        frame = frame.sort_index()
+        for index in range(2, len(frame)):
+            today = frame.iloc[index]
+            yesterday = frame.iloc[index - 1]
+            day_before = frame.iloc[index - 2]
+            rate = 1.2 if symbol.startswith(("300", "301", "688", "689")) else 1.1
+            yesterday_limit = round(float(day_before.close) * rate, 2)
+
+            if float(yesterday.close) < yesterday_limit - 0.01:
+                continue
+            if (
+                float(yesterday.open) >= yesterday_limit - 0.01
+                and float(yesterday.low) == float(yesterday.high)
+            ):
+                continue
+
+            open_pct = (float(today.open) - float(yesterday.close)) / float(yesterday.close)
+            if not (high_open_range[0] <= open_pct <= high_open_range[1]):
+                continue
+
+            today_limit = round(float(yesterday.close) * rate, 2)
+            if float(today.open) >= today_limit - 0.01:
+                continue
+
+            volume_ratio = float(today.volume) / float(yesterday.volume) if float(yesterday.volume) else 0.0
+            if volume_ratio < volume_ratio_min:
+                continue
+
+            amount = float(yesterday.get("amount", 0.0) or 0.0)
+            date_key = pd.Timestamp(frame.index[index]).strftime("%Y-%m-%d")
+            candidates_by_date.setdefault(date_key, []).append(
+                {
+                    "symbol": str(symbol),
+                    "open": float(today.open),
+                    "open_pct": open_pct,
+                    "volume_ratio": volume_ratio,
+                    "amount": amount,
+                }
+            )
+
+    for date_key, candidates in candidates_by_date.items():
+        candidates.sort(
+            key=lambda candidate: (
+                -candidate["amount"],
+                abs(candidate["open_pct"] - 0.05),
+                -candidate["volume_ratio"],
+                candidate["symbol"],
+            )
+        )
+
+    logger.info(
+        "每日候选预计算完成: 交易日=%s, 候选=%s",
+        len(candidates_by_date),
+        sum(len(candidates) for candidates in candidates_by_date.values()),
+    )
+    return candidates_by_date
 
 
 def load_a_share_universe(
@@ -365,7 +469,7 @@ if __name__ == "__main__":
     if not TOKEN:
         raise ValueError("请设置环境变量 TUSHARE_TOKEN")
 
-    start_date = "20220101"
+    start_date = "20260101"
     end_date = "20260812"
     stock_list = load_a_share_universe(
         token=TOKEN,
@@ -378,6 +482,11 @@ if __name__ == "__main__":
         end_date=end_date,
     )
     symbols = sorted(stock_data_dict)
+    daily_candidates = build_daily_candidates(
+        stock_data_dict,
+        high_open_range=(0.03, 0.07),
+        volume_ratio_min=0.8,
+    )
 
     # ================== 运行回测 ==================
     result = run_backtest(
@@ -386,7 +495,8 @@ if __name__ == "__main__":
             volume_ratio_min=0.8,
             stop_loss_pct=-0.05,
             position_pct=0.2,
-            max_positions=5
+            max_positions=5,
+            daily_candidates=daily_candidates,
         ),
         data=stock_data_dict,
         symbols=symbols,
