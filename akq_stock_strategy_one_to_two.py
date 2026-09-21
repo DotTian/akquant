@@ -649,7 +649,7 @@ if __name__ == "__main__":
         raise ValueError("请设置环境变量 TUSHARE_TOKEN")
 
     start_date = "20260101"
-    end_date = "20260812"
+    end_date = "20260914"
     stock_list = load_a_share_universe(
         token=TOKEN,
         start_date=start_date,

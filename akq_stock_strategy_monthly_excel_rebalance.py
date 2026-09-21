@@ -205,7 +205,7 @@ def main() -> None:
     """执行月度调仓回测。"""
     run_selector_first = True
     selector_start_date = "20260101"
-    selector_end_date = "20260812"
+    selector_end_date = "20260917"
     selector_data_dir = "selector_data"
     selector_industries: list[str] | None = [
         "半导体",
